@@ -21,7 +21,7 @@ import tempfile
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal, Union
+from typing import TYPE_CHECKING, Any, Literal, Union
 
 import deepspeed
 import pandas as pd
@@ -38,8 +38,12 @@ from rich.table import Table
 from torch.nn.parallel.distributed import DistributedDataParallel
 
 from open_instruct import logger_utils
-from open_instruct.ground_truth_utils import VerifierFunction
 from open_instruct.utils import retry_on_exception
+
+if TYPE_CHECKING:
+    from open_instruct.ground_truth_utils import VerifierFunction
+else:  # pragma: no cover
+    VerifierFunction = Any
 
 logger = logger_utils.setup_logger(__name__)
 

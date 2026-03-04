@@ -28,6 +28,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Literal
 
 import datasets
@@ -53,6 +54,7 @@ from open_instruct.dataset_transformation import (
     get_cached_dataset_tulu,
     visualize_token,
 )
+from open_instruct.llopa_adapter import LLOPADataCollator, compute_llopa_batch_loss, install_llopa_modeling
 from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
 from open_instruct.padding_free_collator import TensorDataCollatorWithFlattening
 from open_instruct.utils import (
@@ -213,6 +215,40 @@ class FlatArguments:
     use_8bit_optimizer: bool = field(
         default=False, metadata={"help": "Use 8bit optimizer from bitsandbytes. Not compatible with deepspeed."}
     )
+    llopa: bool = field(
+        default=False,
+        metadata={"help": "Enable Capsule LLoPA training path (system/user segmented prefill + assistant decode)."},
+    )
+    llopa_prefill_layers: int = field(
+        default=32, metadata={"help": "Number of lower layers used during LLoPA prefill (K)."}
+    )
+    llopa_prefill_mode: str = field(
+        default="lower", metadata={"help": "LLoPA prefill mode. Currently only 'lower' is supported."}
+    )
+    llopa_prefill_attn: str = field(
+        default="causal", metadata={"help": "LLoPA prefill attention mode: causal or full."}
+    )
+    llopa_system_prefill: str = field(
+        default="no_bos_system", metadata={"help": "LLoPA system prefill mode: full | no_system | no_bos_system."}
+    )
+    llopa_user_prefill: str = field(
+        default="full", metadata={"help": "LLoPA user prefill mode: full | no_question."}
+    )
+    llopa_no_upper_attn: bool = field(
+        default=False, metadata={"help": "LLoPA decode optimization: skip upper-layer attention."}
+    )
+    llopa_loss_scope: str = field(
+        default="last_turn", metadata={"help": "LLoPA assistant loss scope: last_turn | all_assistant."}
+    )
+    llopa_modeling_path: str = field(
+        default="", metadata={"help": "Path to Capsule TRI modeling file (e.g., tri_llama3_modeling.py)."}
+    )
+    lopa_modeling_path: str = field(
+        default="", metadata={"help": "Deprecated alias for --llopa_modeling_path."}
+    )
+    modeling_family: str = field(
+        default="llama", metadata={"help": "Model family for TRI modeling injection: llama | qwen3 | mistral."}
+    )
     warmup_ratio: float = field(
         default=0.03, metadata={"help": "Linear warmup over warmup_ratio fraction of total steps."}
     )
@@ -335,6 +371,24 @@ class FlatArguments:
                 raise NotImplementedError("final_lr_ratio only currently implemented for linear schedulers")
             if not (1.0 >= self.final_lr_ratio >= 0.0):
                 raise ValueError(f"final_lr_ratio must be between 0 and 1, not {self.final_lr_ratio=}")
+        if self.llopa:
+            if self.llopa_prefill_mode != "lower":
+                raise ValueError("LLoPA currently requires llopa_prefill_mode='lower'.")
+            if self.llopa_prefill_attn not in {"causal", "full"}:
+                raise ValueError("LLoPA requires llopa_prefill_attn in {'causal', 'full'}.")
+            if self.llopa_loss_scope not in {"last_turn", "all_assistant"}:
+                raise ValueError("LLoPA requires llopa_loss_scope in {'last_turn', 'all_assistant'}.")
+            if self.packing:
+                raise ValueError("LLoPA path does not support packing.")
+            if self.load_balancing_loss:
+                raise ValueError("LLoPA path does not support load_balancing_loss.")
+        if self.llopa_modeling_path and self.lopa_modeling_path:
+            if self.llopa_modeling_path != self.lopa_modeling_path:
+                raise ValueError(
+                    "Both --llopa_modeling_path and deprecated --lopa_modeling_path were provided with different values."
+                )
+        if not self.llopa_modeling_path and self.lopa_modeling_path:
+            self.llopa_modeling_path = self.lopa_modeling_path
 
         # Parse in args that could be `dict` sent in from the CLI as a string
         for dict_feld in self._VALID_DICT_FIELDS:
@@ -408,9 +462,15 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         if is_beaker_job():
             beaker_config = maybe_get_beaker_config()
 
+    def _safe_wandb_url(tracker):
+        run = getattr(tracker, "run", None)
+        return getattr(run, "url", None)
+
     # ------------------------------------------------------------
     # Initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
+    wandb_tracker = None
+    wandb_url = None
     if args.with_tracking:
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
@@ -434,9 +494,9 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             },
         )
         wandb_tracker = accelerator.get_tracker("wandb")
-        maybe_update_beaker_description(wandb_url=wandb_tracker.run.url)
-    else:
-        wandb_tracker = None  # for later eval launching
+        wandb_url = _safe_wandb_url(wandb_tracker)
+        if accelerator.is_main_process:
+            maybe_update_beaker_description(wandb_url=wandb_url)
 
     if accelerator.is_main_process:
         pprint([args, tc])
@@ -462,6 +522,22 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
     if args.dataset_mixer is not None:
         args.dataset_mixer_list = [item for pair in args.dataset_mixer.items() for item in pair]
+    if args.llopa:
+        if tc.sft_messages_key not in args.dataset_target_columns:
+            args.dataset_target_columns = [*args.dataset_target_columns, tc.sft_messages_key]
+        if args.llopa_modeling_path:
+            modeling_path = args.llopa_modeling_path
+        else:
+            repo_root = Path(__file__).resolve().parents[2]
+            default_name = {
+                "llama": "tri_llama3_modeling.py",
+                "qwen3": "tri_qwen3_modeling.py",
+                "mistral": "tri_mistral_modeling.py",
+            }.get(str(args.modeling_family or "llama").strip().lower(), "tri_llama3_modeling.py")
+            modeling_path = str((repo_root / "Capsule" / default_name).resolve())
+        install_llopa_modeling(modeling_path=modeling_path, model_family=args.modeling_family)
+        logger.info("LLoPA enabled | modeling=%s | family=%s", modeling_path, args.modeling_family)
+
     with accelerator.main_process_first():
         transform_fn_args = [{"max_seq_length": args.max_seq_length}, {}]
         train_dataset = get_cached_dataset_tulu(
@@ -478,7 +554,10 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             dataset_skip_cache=args.dataset_skip_cache,
         )
         train_dataset = train_dataset.shuffle(seed=args.seed)
-        train_dataset.set_format(type="pt")
+        if args.llopa:
+            train_dataset.set_format(type="pt", columns=TOKENIZED_SFT_DATASET_KEYS, output_all_columns=True)
+        else:
+            train_dataset.set_format(type="pt")
     if accelerator.is_main_process:
         visualize_token(train_dataset[0][INPUT_IDS_KEY], tokenizer)
 
@@ -597,6 +676,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     # DataLoaders creation:
     if args.packing:
         collate_fn = TensorDataCollatorWithFlattening()
+    elif args.llopa:
+        collate_fn = LLOPADataCollator(tokenizer=tokenizer, model=model, messages_key=tc.sft_messages_key)
     else:
         collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
 
@@ -760,15 +841,30 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             local_pred_tokens_this_log_period += pred_tokens_in_batch
 
             with accelerator.accumulate(model):
-                if args.load_balancing_loss:
+                if args.llopa:
+                    loss = compute_llopa_batch_loss(
+                        model=model,
+                        tokenizer=tokenizer,
+                        batch=batch,
+                        lower_k=int(args.llopa_prefill_layers),
+                        prefill_mode=str(args.llopa_prefill_mode),
+                        prefill_attn=str(args.llopa_prefill_attn),
+                        system_prefill=str(args.llopa_system_prefill),
+                        user_prefill=str(args.llopa_user_prefill),
+                        no_upper_attn=bool(args.llopa_no_upper_attn),
+                        loss_scope=str(args.llopa_loss_scope),
+                        messages_key=tc.sft_messages_key,
+                    )
+                elif args.load_balancing_loss:
                     outputs = model(**batch, use_cache=False, output_router_logits=True)
                     total_aux_loss += outputs.aux_loss.detach().float()
+                    loss = outputs.loss
+                    del outputs
                 else:
                     # Standard forward pass
                     outputs = model(**batch, use_cache=False)
-
-                loss = outputs.loss
-                del outputs
+                    loss = outputs.loss
+                    del outputs
 
                 # We keep track of the loss at each logged step
                 total_loss += loss.detach().float()
@@ -886,7 +982,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                         current_step=completed_steps,
                         total_steps=args.max_train_steps,
                         start_time=start_time,
-                        wandb_url=wandb_tracker.run.url if wandb_tracker is not None else None,
+                        wandb_url=wandb_url,
                     )
                     total_loss = 0
                     total_aux_loss = 0
@@ -940,7 +1036,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             path=args.output_dir,
             leaderboard_name=args.hf_repo_revision,
             oe_eval_max_length=args.oe_eval_max_length,
-            wandb_url=wandb_tracker.run.url if wandb_tracker is not None else None,
+            wandb_url=wandb_url,
             oe_eval_tasks=args.oe_eval_tasks,
             gs_bucket_path=args.gs_bucket_path,
         )
