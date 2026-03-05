@@ -54,7 +54,12 @@ from open_instruct.dataset_transformation import (
     get_cached_dataset_tulu,
     visualize_token,
 )
-from open_instruct.llopa_adapter import LLOPADataCollator, compute_llopa_batch_loss, install_llopa_modeling
+from open_instruct.llopa_adapter import (
+    LLOPADataCollator,
+    compute_llopa_batch_loss,
+    compute_llopa_batch_loss_streaming_backward,
+    install_llopa_modeling,
+)
 from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
 from open_instruct.padding_free_collator import TensorDataCollatorWithFlattening
 from open_instruct.utils import (
@@ -239,6 +244,17 @@ class FlatArguments:
     )
     llopa_loss_scope: str = field(
         default="last_turn", metadata={"help": "LLoPA assistant loss scope: last_turn | all_assistant."}
+    )
+    use_single_only: bool = field(
+        default=False,
+        metadata={"help": "Use only single-turn samples (one user-assistant exchange, optional system messages)."},
+    )
+    llopa_stream_backward: bool = field(
+        default=True,
+        metadata={
+            "help": "When llopa_loss_scope=all_assistant, run per-turn backward with exact loss scaling "
+            "to reduce peak memory."
+        },
     )
     llopa_modeling_path: str = field(
         default="", metadata={"help": "Path to Capsule TRI modeling file (e.g., tri_llama3_modeling.py)."}
@@ -522,9 +538,10 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
     if args.dataset_mixer is not None:
         args.dataset_mixer_list = [item for pair in args.dataset_mixer.items() for item in pair]
-    if args.llopa:
+    if args.llopa or args.use_single_only:
         if tc.sft_messages_key not in args.dataset_target_columns:
             args.dataset_target_columns = [*args.dataset_target_columns, tc.sft_messages_key]
+    if args.llopa:
         if args.llopa_modeling_path:
             modeling_path = args.llopa_modeling_path
         else:
@@ -539,7 +556,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         logger.info("LLoPA enabled | modeling=%s | family=%s", modeling_path, args.modeling_family)
 
     with accelerator.main_process_first():
-        transform_fn_args = [{"max_seq_length": args.max_seq_length}, {}]
+        transform_fn_args = []
+        for fn_name in args.dataset_transform_fn:
+            if fn_name == "sft_tulu_tokenize_and_truncate_v1":
+                transform_fn_args.append({"max_seq_length": args.max_seq_length})
+            elif fn_name == "sft_tulu_filter_v1":
+                transform_fn_args.append({"use_single_only": bool(args.use_single_only)})
+            else:
+                transform_fn_args.append({})
         train_dataset = get_cached_dataset_tulu(
             dataset_mixer_list=args.dataset_mixer_list,
             dataset_mixer_list_splits=args.dataset_mixer_list_splits,
@@ -554,6 +578,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             dataset_skip_cache=args.dataset_skip_cache,
         )
         train_dataset = train_dataset.shuffle(seed=args.seed)
+        if args.use_single_only and not args.llopa and tc.sft_messages_key in train_dataset.column_names:
+            train_dataset = train_dataset.remove_columns([tc.sft_messages_key])
         if args.llopa:
             train_dataset.set_format(type="pt", columns=TOKENIZED_SFT_DATASET_KEYS, output_all_columns=True)
         else:
@@ -841,20 +867,38 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             local_pred_tokens_this_log_period += pred_tokens_in_batch
 
             with accelerator.accumulate(model):
+                loss_already_backwarded = False
                 if args.llopa:
-                    loss = compute_llopa_batch_loss(
-                        model=model,
-                        tokenizer=tokenizer,
-                        batch=batch,
-                        lower_k=int(args.llopa_prefill_layers),
-                        prefill_mode=str(args.llopa_prefill_mode),
-                        prefill_attn=str(args.llopa_prefill_attn),
-                        system_prefill=str(args.llopa_system_prefill),
-                        user_prefill=str(args.llopa_user_prefill),
-                        no_upper_attn=bool(args.llopa_no_upper_attn),
-                        loss_scope=str(args.llopa_loss_scope),
-                        messages_key=tc.sft_messages_key,
-                    )
+                    if args.llopa_loss_scope == "all_assistant" and args.llopa_stream_backward:
+                        loss = compute_llopa_batch_loss_streaming_backward(
+                            model=model,
+                            tokenizer=tokenizer,
+                            batch=batch,
+                            backward_fn=accelerator.backward,
+                            lower_k=int(args.llopa_prefill_layers),
+                            prefill_mode=str(args.llopa_prefill_mode),
+                            prefill_attn=str(args.llopa_prefill_attn),
+                            system_prefill=str(args.llopa_system_prefill),
+                            user_prefill=str(args.llopa_user_prefill),
+                            no_upper_attn=bool(args.llopa_no_upper_attn),
+                            loss_scope=str(args.llopa_loss_scope),
+                            messages_key=tc.sft_messages_key,
+                        )
+                        loss_already_backwarded = True
+                    else:
+                        loss = compute_llopa_batch_loss(
+                            model=model,
+                            tokenizer=tokenizer,
+                            batch=batch,
+                            lower_k=int(args.llopa_prefill_layers),
+                            prefill_mode=str(args.llopa_prefill_mode),
+                            prefill_attn=str(args.llopa_prefill_attn),
+                            system_prefill=str(args.llopa_system_prefill),
+                            user_prefill=str(args.llopa_user_prefill),
+                            no_upper_attn=bool(args.llopa_no_upper_attn),
+                            loss_scope=str(args.llopa_loss_scope),
+                            messages_key=tc.sft_messages_key,
+                        )
                 elif args.load_balancing_loss:
                     outputs = model(**batch, use_cache=False, output_router_logits=True)
                     total_aux_loss += outputs.aux_loss.detach().float()
@@ -868,7 +912,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
                 # We keep track of the loss at each logged step
                 total_loss += loss.detach().float()
-                accelerator.backward(loss)
+                if not loss_already_backwarded:
+                    accelerator.backward(loss)
                 # clip gradient norm. don't do this with deepspeed
                 if accelerator.sync_gradients and args.clip_grad_norm > 0:
                     accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)

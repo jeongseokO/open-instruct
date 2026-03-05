@@ -267,3 +267,118 @@ def compute_llopa_batch_loss(
     if not sample_losses:
         raise RuntimeError("No valid LLoPA losses in current batch (check message formatting).")
     return torch.stack(sample_losses).mean()
+
+
+def compute_llopa_batch_loss_streaming_backward(
+    model,
+    tokenizer,
+    batch: dict[str, Any],
+    *,
+    backward_fn,
+    lower_k: int,
+    prefill_mode: str,
+    prefill_attn: str,
+    system_prefill: str,
+    user_prefill: str,
+    no_upper_attn: bool,
+    loss_scope: str,
+    messages_key: str = "messages",
+):
+    """Compute all_assistant loss with per-turn backward to lower peak memory.
+
+    This preserves the original weighting:
+      mean_i( mean_t( loss_{i,t} ) )
+    by scaling each backward term with 1 / (num_valid_samples * turns_in_sample_i).
+    """
+    if prefill_mode != "lower":
+        raise ValueError("LLoPA requires prefill_mode='lower'.")
+    if prefill_attn not in {"causal", "full"}:
+        raise ValueError("LLoPA requires prefill_attn in {'causal', 'full'}.")
+    if loss_scope != "all_assistant":
+        raise ValueError("Streaming backward path only supports loss_scope='all_assistant'.")
+
+    messages_batch = batch.get(messages_key)
+    if not isinstance(messages_batch, list):
+        raise RuntimeError(f"LLoPA batch is missing '{messages_key}' list.")
+
+    step_fn = _get_llopa_step_fn(model)
+    device = batch["input_ids"].device
+    prepared_samples: list[list[dict[str, torch.Tensor]]] = []
+
+    # First pass: build all valid turn tensors and count valid samples.
+    for sample_messages in messages_batch:
+        msgs = normalize_prompt_messages(sample_messages)
+        assistant_turns = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
+        if not assistant_turns:
+            continue
+
+        prepared_turns: list[dict[str, torch.Tensor]] = []
+        for turn_idx in assistant_turns:
+            assistant_text = str(msgs[turn_idx].get("content") or "").strip()
+            if not assistant_text:
+                continue
+            prefix_msgs = msgs[:turn_idx]
+            _, system_ids, user_ids, su_gen, assistant_header_delta = _build_segments(tokenizer, prefix_msgs, device)
+            assistant_delta = _assistant_content_delta(tokenizer, prefix_msgs, assistant_text, su_gen, device)
+            if assistant_delta.size(1) < 1:
+                continue
+
+            # For generic chat messages we do not have explicit doc/question split.
+            if (user_prefill or "full").strip().lower() == "no_question":
+                user_prefill_ids = user_ids
+                prefix_delta = assistant_header_delta
+            else:
+                user_prefill_ids = user_ids
+                prefix_delta = assistant_header_delta
+
+            sys_upper, user_llopa = _llopa_merge_user(system_ids, user_prefill_ids, system_prefill)
+            assistant_ids = torch.cat([prefix_delta, assistant_delta], dim=1)
+            if assistant_ids.size(1) < 2:
+                continue
+
+            labels = assistant_ids.clone()
+            if prefix_delta.size(1) > 0:
+                labels[:, : prefix_delta.size(1)] = -100
+
+            prepared_turns.append(
+                {
+                    "system_ids": sys_upper,
+                    "user_ids": user_llopa,
+                    "assistant_ids": assistant_ids,
+                    "labels": labels,
+                }
+            )
+
+        if prepared_turns:
+            prepared_samples.append(prepared_turns)
+
+    if not prepared_samples:
+        raise RuntimeError("No valid LLoPA losses in current batch (check message formatting).")
+
+    num_valid_samples = len(prepared_samples)
+    total_loss_detached = torch.zeros((), device=device, dtype=torch.float32)
+
+    # Second pass: backward per turn with exact objective scaling.
+    for sample_turns in prepared_samples:
+        turns_in_sample = len(sample_turns)
+        sample_loss_detached = torch.zeros((), device=device, dtype=torch.float32)
+        for turn in sample_turns:
+            out = step_fn(
+                system_ids=turn["system_ids"],
+                user_ids=turn["user_ids"],
+                assistant_ids=turn["assistant_ids"],
+                lower_k=int(lower_k),
+                logits_to_keep=turn["assistant_ids"].size(1),
+                labels=turn["labels"],
+                prefill_mode=prefill_mode,
+                prefill_attn=prefill_attn,
+                no_upper_attn=bool(no_upper_attn),
+            )
+            if out.loss is None:
+                continue
+            scaled_loss = out.loss / (num_valid_samples * turns_in_sample)
+            backward_fn(scaled_loss)
+            sample_loss_detached = sample_loss_detached + (out.loss.detach().float() / turns_in_sample)
+        total_loss_detached = total_loss_detached + sample_loss_detached
+
+    return total_loss_detached / num_valid_samples

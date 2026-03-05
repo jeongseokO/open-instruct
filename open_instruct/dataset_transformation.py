@@ -891,12 +891,6 @@ class TokenizerConfig:
     def tokenizer(self):
         if self.tokenizer_name_or_path is None:
             raise ValueError("tokenizer_name_or_path must be set")
-        files_hash = get_files_hash_if_exists(
-            self.tokenizer_name_or_path,
-            self.tokenizer_revision,
-            filenames=["tokenizer_config.json", "tokenizer.json", "special_tokens_map.json", "vocab.json"],
-        )
-        self.tokenizer_files_hash = files_hash
         if self.tokenizer_name is not None and self.tokenizer_name_or_path is None:
             if self.tokenizer_name != self.tokenizer_name_or_path:
                 raise ValueError(
@@ -904,7 +898,16 @@ class TokenizerConfig:
                     " you should use only `--tokenizer_name_or_path` in the future as `tokenizer_name` is deprecated."
                 )
             self.tokenizer_name_or_path = self.tokenizer_name
-        return GET_TOKENIZER_FN[self.get_tokenizer_fn](self)
+        # Load tokenizer first so model files are cached before we hash them.
+        # This avoids per-rank hash drift (e.g., "not found" vs resolved hash) in distributed jobs.
+        tokenizer = GET_TOKENIZER_FN[self.get_tokenizer_fn](self)
+        files_hash = get_files_hash_if_exists(
+            self.tokenizer_name_or_path,
+            self.tokenizer_revision,
+            filenames=["tokenizer_config.json", "tokenizer.json", "special_tokens_map.json", "vocab.json"],
+        )
+        self.tokenizer_files_hash = files_hash
+        return tokenizer
 
 
 # TODO: for testing, we should load the tokenizer from the sft / dpo / rl and make sure they are all the same.
@@ -1201,8 +1204,29 @@ def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreT
     return row
 
 
-def sft_tulu_filter_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer):
-    return any(x != -100 for x in row[LABELS_KEY])
+def _is_single_turn_messages(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    qa_roles: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        role = message.get("role")
+        if not isinstance(role, str):
+            return False
+        if role in {"user", "assistant"}:
+            qa_roles.append(role)
+    return qa_roles == ["user", "assistant"]
+
+
+def sft_tulu_filter_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, use_single_only: bool = False):
+    has_trainable_labels = any(x != -100 for x in row[LABELS_KEY])
+    if not has_trainable_labels:
+        return False
+    if not use_single_only:
+        return True
+    messages = row.get(DEFAULT_SFT_MESSAGES_KEY)
+    return _is_single_turn_messages(messages)
 
 
 def preference_tokenize_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer):
