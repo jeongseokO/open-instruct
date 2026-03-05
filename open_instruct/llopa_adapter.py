@@ -80,6 +80,16 @@ def _get_llopa_step_fn(model):
     raise RuntimeError("LLoPA step function not found (missing llopa_step_logits on model).")
 
 
+def _zero_proxy_loss(model, device: torch.device) -> torch.Tensor:
+    """Return a differentiable zero scalar to safely skip invalid LLoPA batches."""
+    try:
+        base = _unwrap_model(model)
+        p = next(base.parameters())
+        return p.sum() * 0.0
+    except Exception:
+        return torch.zeros((), device=device, dtype=torch.float32, requires_grad=True)
+
+
 def normalize_prompt_messages(messages: Any) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     if not isinstance(messages, list):
@@ -265,7 +275,8 @@ def compute_llopa_batch_loss(
             sample_losses.append(torch.stack(turn_losses).mean())
 
     if not sample_losses:
-        raise RuntimeError("No valid LLoPA losses in current batch (check message formatting).")
+        logger.warning("No valid LLoPA losses in current batch; skipping this batch.")
+        return _zero_proxy_loss(model, device)
     return torch.stack(sample_losses).mean()
 
 
@@ -353,7 +364,8 @@ def compute_llopa_batch_loss_streaming_backward(
             prepared_samples.append(prepared_turns)
 
     if not prepared_samples:
-        raise RuntimeError("No valid LLoPA losses in current batch (check message formatting).")
+        logger.warning("No valid LLoPA losses in current batch; skipping this batch.")
+        return _zero_proxy_loss(model, device)
 
     num_valid_samples = len(prepared_samples)
     total_loss_detached = torch.zeros((), device=device, dtype=torch.float32)
