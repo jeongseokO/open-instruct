@@ -80,8 +80,28 @@ def _get_llopa_step_fn(model):
     raise RuntimeError("LLoPA step function not found (missing llopa_step_logits on model).")
 
 
-def _zero_proxy_loss(model, device: torch.device) -> torch.Tensor:
-    """Return a differentiable zero scalar to safely skip invalid LLoPA batches."""
+def _zero_proxy_loss(model, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
+    """Return a differentiable zero scalar while preserving distributed collectives.
+
+    For ZeRO/DDP, ranks must execute a compatible backward graph. When a local rank
+    has no valid LLoPA sample, run one standard forward on the batch and zero it out
+    so every rank still participates in expected gradient communications.
+    """
+    token_batch: dict[str, Any] = {}
+    for key in ("input_ids", "attention_mask", "position_ids", "labels"):
+        value = batch.get(key)
+        if value is not None:
+            token_batch[key] = value
+    try:
+        if token_batch:
+            outputs = model(**token_batch, use_cache=False)
+            loss = getattr(outputs, "loss", None)
+            if loss is not None:
+                return torch.nan_to_num(loss.float(), nan=0.0, posinf=0.0, neginf=0.0) * 0.0
+    except Exception:
+        pass
+
+    # Last-resort fallback.
     try:
         base = _unwrap_model(model)
         p = next(base.parameters())
@@ -276,7 +296,7 @@ def compute_llopa_batch_loss(
 
     if not sample_losses:
         logger.warning("No valid LLoPA losses in current batch; skipping this batch.")
-        return _zero_proxy_loss(model, device)
+        return _zero_proxy_loss(model, batch, device)
     return torch.stack(sample_losses).mean()
 
 
@@ -365,7 +385,7 @@ def compute_llopa_batch_loss_streaming_backward(
 
     if not prepared_samples:
         logger.warning("No valid LLoPA losses in current batch; skipping this batch.")
-        return _zero_proxy_loss(model, device)
+        return _zero_proxy_loss(model, batch, device)
 
     num_valid_samples = len(prepared_samples)
     total_loss_detached = torch.zeros((), device=device, dtype=torch.float32)

@@ -538,7 +538,10 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
     if args.dataset_mixer is not None:
         args.dataset_mixer_list = [item for pair in args.dataset_mixer.items() for item in pair]
-    if args.llopa or args.use_single_only:
+    # Keep raw messages whenever SFT filtering needs them.
+    # This also enforces identical sample filtering between LLoPA and vanilla runs.
+    needs_messages_for_sft_filter = "sft_tulu_filter_v1" in args.dataset_transform_fn
+    if needs_messages_for_sft_filter or args.use_single_only or args.llopa:
         if tc.sft_messages_key not in args.dataset_target_columns:
             args.dataset_target_columns = [*args.dataset_target_columns, tc.sft_messages_key]
     if args.llopa:
@@ -561,7 +564,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             if fn_name == "sft_tulu_tokenize_and_truncate_v1":
                 transform_fn_args.append({"max_seq_length": args.max_seq_length})
             elif fn_name == "sft_tulu_filter_v1":
-                transform_fn_args.append({"use_single_only": bool(args.use_single_only)})
+                filter_args = {
+                    "use_single_only": bool(args.use_single_only),
+                    # Apply the same validity filter in both vanilla and LLoPA runs
+                    # so dataset membership remains identical.
+                    "llopa_require_valid_assistant": True,
+                    "llopa_loss_scope": str(args.llopa_loss_scope),
+                }
+                transform_fn_args.append(filter_args)
             else:
                 transform_fn_args.append({})
         train_dataset = get_cached_dataset_tulu(

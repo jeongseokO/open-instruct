@@ -1219,13 +1219,48 @@ def _is_single_turn_messages(messages: Any) -> bool:
     return qa_roles == ["user", "assistant"]
 
 
-def sft_tulu_filter_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, use_single_only: bool = False):
+def _has_valid_llopa_assistant(messages: Any, llopa_loss_scope: str = "last_turn") -> bool:
+    """Check whether messages can produce at least one LLoPA assistant loss target."""
+    if not isinstance(messages, list):
+        return False
+
+    assistant_contents: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "assistant":
+            continue
+        content = str(message.get("content") or "").strip()
+        assistant_contents.append(content)
+
+    if not assistant_contents:
+        return False
+
+    scope = (llopa_loss_scope or "last_turn").strip().lower()
+    if scope == "last_turn":
+        return assistant_contents[-1] != ""
+    if scope == "all_assistant":
+        return any(content != "" for content in assistant_contents)
+    # Conservative fallback for unknown scope.
+    return any(content != "" for content in assistant_contents)
+
+
+def sft_tulu_filter_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    use_single_only: bool = False,
+    llopa_require_valid_assistant: bool = False,
+    llopa_loss_scope: str = "last_turn",
+):
     has_trainable_labels = any(x != -100 for x in row[LABELS_KEY])
     if not has_trainable_labels:
         return False
+    messages = row.get(DEFAULT_SFT_MESSAGES_KEY)
+    if llopa_require_valid_assistant:
+        if not _has_valid_llopa_assistant(messages, llopa_loss_scope=llopa_loss_scope):
+            return False
     if not use_single_only:
         return True
-    messages = row.get(DEFAULT_SFT_MESSAGES_KEY)
     return _is_single_turn_messages(messages)
 
 
