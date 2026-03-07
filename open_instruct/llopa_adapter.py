@@ -13,6 +13,24 @@ from open_instruct import logger_utils
 logger = logger_utils.setup_logger(__name__)
 
 
+LLOPA_SYSTEM_IDS_KEY = "llopa_system_ids"
+LLOPA_SYSTEM_MASK_KEY = "llopa_system_attention_mask"
+LLOPA_USER_IDS_KEY = "llopa_user_ids"
+LLOPA_USER_MASK_KEY = "llopa_user_attention_mask"
+LLOPA_ASSISTANT_IDS_KEY = "llopa_assistant_ids"
+LLOPA_ASSISTANT_MASK_KEY = "llopa_assistant_attention_mask"
+LLOPA_LABELS_KEY = "llopa_labels"
+_WARNED_BATCHED_LAST_TURN_FALLBACK = False
+
+
+def _warn_batched_last_turn_fallback_once(message: str) -> None:
+    global _WARNED_BATCHED_LAST_TURN_FALLBACK
+    if _WARNED_BATCHED_LAST_TURN_FALLBACK:
+        return
+    _WARNED_BATCHED_LAST_TURN_FALLBACK = True
+    logger.warning(message)
+
+
 def install_llopa_modeling(modeling_path: str, model_family: str = "llama") -> None:
     """Load Capsule TRI modeling into the corresponding transformers module path."""
     path = Path(modeling_path).expanduser().resolve()
@@ -194,12 +212,120 @@ def _llopa_merge_user(system_ids: torch.Tensor, user_ids: torch.Tensor, system_p
     return sys_upper, user_llopa
 
 
+def _pad_segment_batch(tensors: list[torch.Tensor], pad_value: int):
+    batch_size = len(tensors)
+    max_len = max((int(t.size(1)) for t in tensors), default=0)
+    dtype = tensors[0].dtype if tensors else torch.long
+    padded = torch.full((batch_size, max_len), pad_value, dtype=dtype)
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+    for i, tensor in enumerate(tensors):
+        width = int(tensor.size(1))
+        if width <= 0:
+            continue
+        padded[i, :width] = tensor.squeeze(0)
+        attention_mask[i, :width] = 1
+    return padded, attention_mask
+
+
+def _build_llopa_last_turn_example(
+    tokenizer,
+    sample_messages: Any,
+    *,
+    system_prefill: str,
+    user_prefill: str,
+):
+    device = torch.device("cpu")
+    msgs = normalize_prompt_messages(sample_messages)
+    assistant_turns = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
+    if not assistant_turns:
+        return None
+
+    turn_idx = assistant_turns[-1]
+    assistant_text = str(msgs[turn_idx].get("content") or "").strip()
+    if not assistant_text:
+        return None
+
+    prefix_msgs = msgs[:turn_idx]
+    _, system_ids, user_ids, su_gen, assistant_header_delta = _build_segments(tokenizer, prefix_msgs, device)
+    assistant_delta = _assistant_content_delta(tokenizer, prefix_msgs, assistant_text, su_gen, device)
+    if assistant_delta.size(1) < 1:
+        return None
+
+    if (user_prefill or "full").strip().lower() == "no_question":
+        user_prefill_ids = user_ids
+        prefix_delta = assistant_header_delta
+    else:
+        user_prefill_ids = user_ids
+        prefix_delta = assistant_header_delta
+
+    sys_upper, user_llopa = _llopa_merge_user(system_ids, user_prefill_ids, system_prefill)
+    assistant_ids = torch.cat([prefix_delta, assistant_delta], dim=1)
+    if assistant_ids.size(1) < 2:
+        return None
+
+    labels = assistant_ids.clone()
+    if prefix_delta.size(1) > 0:
+        labels[:, : prefix_delta.size(1)] = -100
+
+    return {
+        LLOPA_SYSTEM_IDS_KEY: sys_upper,
+        LLOPA_USER_IDS_KEY: user_llopa,
+        LLOPA_ASSISTANT_IDS_KEY: assistant_ids,
+        LLOPA_LABELS_KEY: labels,
+    }
+
+
+def _batch_llopa_last_turn_examples(tokenizer, messages_batch: list[Any], *, system_prefill: str, user_prefill: str):
+    examples = []
+    for sample_messages in messages_batch:
+        example = _build_llopa_last_turn_example(
+            tokenizer,
+            sample_messages,
+            system_prefill=system_prefill,
+            user_prefill=user_prefill,
+        )
+        if example is None:
+            return None
+        examples.append(example)
+
+    pad_token_id = getattr(tokenizer, "pad_token_id", 0)
+    if pad_token_id is None:
+        pad_token_id = 0
+
+    system_ids, system_mask = _pad_segment_batch([ex[LLOPA_SYSTEM_IDS_KEY] for ex in examples], pad_token_id)
+    user_ids, user_mask = _pad_segment_batch([ex[LLOPA_USER_IDS_KEY] for ex in examples], pad_token_id)
+    assistant_ids, assistant_mask = _pad_segment_batch([ex[LLOPA_ASSISTANT_IDS_KEY] for ex in examples], pad_token_id)
+    labels, _ = _pad_segment_batch([ex[LLOPA_LABELS_KEY] for ex in examples], -100)
+    return {
+        LLOPA_SYSTEM_IDS_KEY: system_ids,
+        LLOPA_SYSTEM_MASK_KEY: system_mask,
+        LLOPA_USER_IDS_KEY: user_ids,
+        LLOPA_USER_MASK_KEY: user_mask,
+        LLOPA_ASSISTANT_IDS_KEY: assistant_ids,
+        LLOPA_ASSISTANT_MASK_KEY: assistant_mask,
+        LLOPA_LABELS_KEY: labels,
+    }
+
+
 class LLOPADataCollator:
     """Token collator + raw message passthrough for LLoPA-specific training."""
 
-    def __init__(self, tokenizer, model, messages_key: str = "messages"):
+    def __init__(
+        self,
+        tokenizer,
+        model,
+        messages_key: str = "messages",
+        *,
+        enable_batched_last_turn: bool = False,
+        system_prefill: str = "full",
+        user_prefill: str = "full",
+    ):
         self.base = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
+        self.tokenizer = tokenizer
         self.messages_key = messages_key
+        self.enable_batched_last_turn = bool(enable_batched_last_turn)
+        self.system_prefill = str(system_prefill)
+        self.user_prefill = str(user_prefill)
 
     def __call__(self, features):
         messages = [f.get(self.messages_key) for f in features]
@@ -207,6 +333,19 @@ class LLOPADataCollator:
         stripped = [{k: v for k, v in f.items() if k in token_keys} for f in features]
         batch = self.base(stripped)
         batch[self.messages_key] = messages
+        if self.enable_batched_last_turn:
+            batched_inputs = _batch_llopa_last_turn_examples(
+                self.tokenizer,
+                messages,
+                system_prefill=self.system_prefill,
+                user_prefill=self.user_prefill,
+            )
+            if batched_inputs is not None:
+                batch.update(batched_inputs)
+            else:
+                _warn_batched_last_turn_fallback_once(
+                    "Falling back to generic LLoPA last_turn path because batched segment construction failed."
+                )
         return batch
 
 
@@ -235,6 +374,30 @@ def compute_llopa_batch_loss(
 
     step_fn = _get_llopa_step_fn(model)
     device = batch["input_ids"].device
+
+    batched_system_ids = batch.get(LLOPA_SYSTEM_IDS_KEY)
+    if loss_scope == "last_turn" and batched_system_ids is not None and prefill_attn == "causal":
+        out = step_fn(
+            system_ids=batched_system_ids.to(device=device),
+            system_attention_mask=batch[LLOPA_SYSTEM_MASK_KEY].to(device=device),
+            user_ids=batch[LLOPA_USER_IDS_KEY].to(device=device),
+            user_attention_mask=batch[LLOPA_USER_MASK_KEY].to(device=device),
+            assistant_ids=batch[LLOPA_ASSISTANT_IDS_KEY].to(device=device),
+            assistant_attention_mask=batch[LLOPA_ASSISTANT_MASK_KEY].to(device=device),
+            lower_k=int(lower_k),
+            logits_to_keep=batch[LLOPA_ASSISTANT_IDS_KEY].size(1),
+            labels=batch[LLOPA_LABELS_KEY].to(device=device),
+            prefill_mode=prefill_mode,
+            prefill_attn=prefill_attn,
+            no_upper_attn=bool(no_upper_attn),
+        )
+        if out.loss is not None:
+            return out.loss
+    elif loss_scope == "last_turn" and prefill_attn == "causal":
+        _warn_batched_last_turn_fallback_once(
+            "Using generic LLoPA last_turn loss path because prebatched segment tensors are unavailable."
+        )
+
     sample_losses = []
 
     for sample_messages in messages_batch:

@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import datasets
 import torch
@@ -242,6 +242,10 @@ class FlatArguments:
     llopa_no_upper_attn: bool = field(
         default=False, metadata={"help": "LLoPA decode optimization: skip upper-layer attention."}
     )
+    skip_upper_attention_layers: int = field(
+        default=0,
+        metadata={"help": "For full-sequence training, preserve attention in the first K layers and skip attention above them."},
+    )
     llopa_loss_scope: str = field(
         default="last_turn", metadata={"help": "LLoPA assistant loss scope: last_turn | all_assistant."}
     )
@@ -255,6 +259,10 @@ class FlatArguments:
             "help": "When llopa_loss_scope=all_assistant, run per-turn backward with exact loss scaling "
             "to reduce peak memory."
         },
+    )
+    llopa_profile_memory_steps: int = field(
+        default=0,
+        metadata={"help": "Profile LLoPA/vanilla CUDA memory for the first N optimizer steps."},
     )
     llopa_modeling_path: str = field(
         default="", metadata={"help": "Path to Capsule TRI modeling file (e.g., tri_llama3_modeling.py)."}
@@ -544,7 +552,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     if needs_messages_for_sft_filter or args.use_single_only or args.llopa:
         if tc.sft_messages_key not in args.dataset_target_columns:
             args.dataset_target_columns = [*args.dataset_target_columns, tc.sft_messages_key]
-    if args.llopa:
+    needs_capsule_modeling = bool(args.llopa or args.skip_upper_attention_layers > 0)
+    if needs_capsule_modeling:
         if args.llopa_modeling_path:
             modeling_path = args.llopa_modeling_path
         else:
@@ -556,7 +565,15 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             }.get(str(args.modeling_family or "llama").strip().lower(), "tri_llama3_modeling.py")
             modeling_path = str((repo_root / "Capsule" / default_name).resolve())
         install_llopa_modeling(modeling_path=modeling_path, model_family=args.modeling_family)
-        logger.info("LLoPA enabled | modeling=%s | family=%s", modeling_path, args.modeling_family)
+        if args.llopa:
+            logger.info("LLoPA enabled | modeling=%s | family=%s", modeling_path, args.modeling_family)
+        if args.skip_upper_attention_layers > 0:
+            logger.info(
+                "Full-sequence upper-attention skip enabled | skip_from_layer=%s | modeling=%s | family=%s",
+                args.skip_upper_attention_layers,
+                modeling_path,
+                args.modeling_family,
+            )
 
     with accelerator.main_process_first():
         transform_fn_args = []
@@ -638,7 +655,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 trust_remote_code=tc.trust_remote_code,
                 quantization_config=bnb_config,
                 device_map=device_map,
-                dtype=torch.bfloat16,
+                torch_dtype=torch.bfloat16,
                 attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
             )
         elif args.use_liger_kernel:
@@ -666,7 +683,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 config=config,
                 trust_remote_code=tc.trust_remote_code,
                 low_cpu_mem_usage=args.low_cpu_mem_usage,
-                dtype=torch.bfloat16,
+                torch_dtype=torch.bfloat16,
                 attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
             )
     else:
@@ -713,7 +730,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     if args.packing:
         collate_fn = TensorDataCollatorWithFlattening()
     elif args.llopa:
-        collate_fn = LLOPADataCollator(tokenizer=tokenizer, model=model, messages_key=tc.sft_messages_key)
+        collate_fn = LLOPADataCollator(
+            tokenizer=tokenizer,
+            model=model,
+            messages_key=tc.sft_messages_key,
+            enable_batched_last_turn=bool(args.use_single_only and args.llopa_loss_scope == "last_turn"),
+            system_prefill=str(args.llopa_system_prefill),
+            user_prefill=str(args.llopa_user_prefill),
+        )
     else:
         collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
 
@@ -846,6 +870,72 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     total_token_including_padding = torch.tensor(0, dtype=torch.int64, device=accelerator.device)
     start_time = time.perf_counter()
     skipped_batches = False
+    skipped_oom_batches = 0
+
+    def _is_cuda_oom_error(exc: BaseException) -> bool:
+        if isinstance(exc, torch.OutOfMemoryError):
+            return True
+        msg = str(exc).lower()
+        return "out of memory" in msg and "cuda" in msg
+
+    def _iter_llopa_profile_targets(obj):
+        seen: set[int] = set()
+        stack = [obj]
+        while stack:
+            current = stack.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            yield current
+            for attr in ("module", "model", "base_model"):
+                with contextlib.suppress(Exception):
+                    child = getattr(current, attr)
+                    if child is not None:
+                        stack.append(child)
+            if hasattr(current, "get_base_model"):
+                with contextlib.suppress(Exception):
+                    child = current.get_base_model()
+                    if child is not None:
+                        stack.append(child)
+
+    def _set_llopa_profile_state(obj, *, enabled: bool, step: int) -> None:
+        for target in _iter_llopa_profile_targets(obj):
+            with contextlib.suppress(Exception):
+                setattr(target, "_llopa_profile_memory_enabled", bool(enabled))
+            with contextlib.suppress(Exception):
+                setattr(target, "_llopa_profile_memory_step", int(step))
+
+    def _batch_profile_lengths(batch_data: dict[str, Any]) -> tuple[int, int, int, int]:
+        sequence_len = int(batch_data["input_ids"].size(1)) if "input_ids" in batch_data else -1
+        system_len = user_len = assistant_len = -1
+        if "llopa_system_attention_mask" in batch_data:
+            system_len = int(batch_data["llopa_system_attention_mask"].sum(dim=1, dtype=torch.long).max().item())
+        if "llopa_user_attention_mask" in batch_data:
+            user_len = int(batch_data["llopa_user_attention_mask"].sum(dim=1, dtype=torch.long).max().item())
+        if "llopa_assistant_attention_mask" in batch_data:
+            assistant_len = int(batch_data["llopa_assistant_attention_mask"].sum(dim=1, dtype=torch.long).max().item())
+        return system_len, user_len, assistant_len, sequence_len
+
+    def _log_memory_profile(stage: str, batch_data: dict[str, Any], step: int) -> None:
+        if accelerator.device.type != "cuda":
+            return
+        system_len, user_len, assistant_len, sequence_len = _batch_profile_lengths(batch_data)
+        logger.info(
+            "[LLOPA_MEM] step=%s rank=%s stage=%s system_len=%s user_len=%s assistant_len=%s sequence_len=%s "
+            "allocated_GiB=%.3f reserved_GiB=%.3f max_allocated_GiB=%.3f max_reserved_GiB=%.3f",
+            step,
+            accelerator.process_index,
+            stage,
+            system_len,
+            user_len,
+            assistant_len,
+            sequence_len,
+            torch.cuda.memory_allocated(device=accelerator.device) / 2**30,
+            torch.cuda.memory_reserved(device=accelerator.device) / 2**30,
+            torch.cuda.max_memory_allocated(device=accelerator.device) / 2**30,
+            torch.cuda.max_memory_reserved(device=accelerator.device) / 2**30,
+        )
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         train_dataloader.set_epoch(epoch)
@@ -860,15 +950,19 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             active_dataloader = train_dataloader
         for batch in active_dataloader:
             pred_tokens_in_batch = (batch["labels"] != -100).sum()
+            tokens_including_padding_in_batch = 0
             if "attention_mask" in batch:
                 tokens_in_batch = batch["attention_mask"].sum()
-                total_token_including_padding += batch["attention_mask"].numel()
+                tokens_including_padding_in_batch = batch["attention_mask"].numel()
+                total_token_including_padding += tokens_including_padding_in_batch
             elif "position_ids" in batch:
                 tokens_in_batch = batch["position_ids"].numel()
-                total_token_including_padding += tokens_in_batch
+                tokens_including_padding_in_batch = tokens_in_batch
+                total_token_including_padding += tokens_including_padding_in_batch
             elif "cu_seq_lens_q" in batch:
                 tokens_in_batch = batch["cu_seq_lens_q"][-1]
-                total_token_including_padding += tokens_in_batch
+                tokens_including_padding_in_batch = tokens_in_batch
+                total_token_including_padding += tokens_including_padding_in_batch
             else:
                 raise ValueError(f"Expected attention_mask or position_ids or cu_seq_lens_q in batch, found {batch=}")
             local_total_tokens += tokens_in_batch
@@ -876,60 +970,139 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             local_pred_tokens += pred_tokens_in_batch
             local_pred_tokens_this_log_period += pred_tokens_in_batch
 
-            with accelerator.accumulate(model):
-                loss_already_backwarded = False
-                if args.llopa:
-                    if args.llopa_loss_scope == "all_assistant" and args.llopa_stream_backward:
-                        loss = compute_llopa_batch_loss_streaming_backward(
-                            model=model,
-                            tokenizer=tokenizer,
-                            batch=batch,
-                            backward_fn=accelerator.backward,
-                            lower_k=int(args.llopa_prefill_layers),
-                            prefill_mode=str(args.llopa_prefill_mode),
-                            prefill_attn=str(args.llopa_prefill_attn),
-                            system_prefill=str(args.llopa_system_prefill),
-                            user_prefill=str(args.llopa_user_prefill),
-                            no_upper_attn=bool(args.llopa_no_upper_attn),
-                            loss_scope=str(args.llopa_loss_scope),
-                            messages_key=tc.sft_messages_key,
+            loss = None
+            loss_already_backwarded = False
+            local_oom = torch.zeros(1, dtype=torch.int32, device=accelerator.device)
+            using_stream_backward = args.llopa and args.llopa_loss_scope == "all_assistant" and args.llopa_stream_backward
+            profile_this_step = bool(args.llopa_profile_memory_steps > 0 and completed_steps < args.llopa_profile_memory_steps)
+            _set_llopa_profile_state(
+                model,
+                enabled=bool(profile_this_step and (args.llopa or args.skip_upper_attention_layers > 0)),
+                step=completed_steps + 1,
+            )
+            if profile_this_step and accelerator.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device=accelerator.device)
+                _log_memory_profile("batch_received", batch, completed_steps + 1)
+            try:
+                with accelerator.accumulate(model):
+                    if args.llopa:
+                        if using_stream_backward:
+                            loss = compute_llopa_batch_loss_streaming_backward(
+                                model=model,
+                                tokenizer=tokenizer,
+                                batch=batch,
+                                backward_fn=accelerator.backward,
+                                lower_k=int(args.llopa_prefill_layers),
+                                prefill_mode=str(args.llopa_prefill_mode),
+                                prefill_attn=str(args.llopa_prefill_attn),
+                                system_prefill=str(args.llopa_system_prefill),
+                                user_prefill=str(args.llopa_user_prefill),
+                                no_upper_attn=bool(args.llopa_no_upper_attn),
+                                loss_scope=str(args.llopa_loss_scope),
+                                messages_key=tc.sft_messages_key,
+                            )
+                            loss_already_backwarded = True
+                        else:
+                            loss = compute_llopa_batch_loss(
+                                model=model,
+                                tokenizer=tokenizer,
+                                batch=batch,
+                                lower_k=int(args.llopa_prefill_layers),
+                                prefill_mode=str(args.llopa_prefill_mode),
+                                prefill_attn=str(args.llopa_prefill_attn),
+                                system_prefill=str(args.llopa_system_prefill),
+                                user_prefill=str(args.llopa_user_prefill),
+                                no_upper_attn=bool(args.llopa_no_upper_attn),
+                                loss_scope=str(args.llopa_loss_scope),
+                                messages_key=tc.sft_messages_key,
+                            )
+                    elif args.load_balancing_loss:
+                        outputs = model(
+                            **batch,
+                            use_cache=False,
+                            output_router_logits=True,
+                            skip_upper_attention_layers=int(args.skip_upper_attention_layers),
                         )
-                        loss_already_backwarded = True
+                        total_aux_loss += outputs.aux_loss.detach().float()
+                        loss = outputs.loss
+                        del outputs
                     else:
-                        loss = compute_llopa_batch_loss(
-                            model=model,
-                            tokenizer=tokenizer,
-                            batch=batch,
-                            lower_k=int(args.llopa_prefill_layers),
-                            prefill_mode=str(args.llopa_prefill_mode),
-                            prefill_attn=str(args.llopa_prefill_attn),
-                            system_prefill=str(args.llopa_system_prefill),
-                            user_prefill=str(args.llopa_user_prefill),
-                            no_upper_attn=bool(args.llopa_no_upper_attn),
-                            loss_scope=str(args.llopa_loss_scope),
-                            messages_key=tc.sft_messages_key,
+                        # Standard forward pass
+                        outputs = model(
+                            **batch,
+                            use_cache=False,
+                            skip_upper_attention_layers=int(args.skip_upper_attention_layers),
                         )
-                elif args.load_balancing_loss:
-                    outputs = model(**batch, use_cache=False, output_router_logits=True)
-                    total_aux_loss += outputs.aux_loss.detach().float()
-                    loss = outputs.loss
-                    del outputs
-                else:
-                    # Standard forward pass
-                    outputs = model(**batch, use_cache=False)
-                    loss = outputs.loss
-                    del outputs
+                        loss = outputs.loss
+                        del outputs
+                    if profile_this_step:
+                        _log_memory_profile("after_forward", batch, completed_steps + 1)
+            except (torch.OutOfMemoryError, RuntimeError) as exc:
+                if not _is_cuda_oom_error(exc):
+                    raise
+                if using_stream_backward:
+                    raise RuntimeError(
+                        "CUDA OOM occurred during LLoPA streaming-backward path. "
+                        "This path cannot safely skip OOM batches in distributed mode."
+                    ) from exc
+                local_oom.fill_(1)
+                if accelerator.is_main_process:
+                    logger.warning("CUDA OOM detected. Marking this batch to skip across all ranks.")
+                with contextlib.suppress(Exception):
+                    optimizer.zero_grad()
+                with contextlib.suppress(Exception):
+                    model.zero_grad()
+                with contextlib.suppress(Exception):
+                    torch.cuda.empty_cache()
 
-                # We keep track of the loss at each logged step
-                total_loss += loss.detach().float()
-                if not loss_already_backwarded:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(local_oom, op=torch.distributed.ReduceOp.MAX)
+
+            if local_oom.item() > 0:
+                # Roll back token counters for a skipped batch to keep logging stats meaningful.
+                local_total_tokens -= tokens_in_batch
+                local_total_tokens_this_log_period -= tokens_in_batch
+                local_pred_tokens -= pred_tokens_in_batch
+                local_pred_tokens_this_log_period -= pred_tokens_in_batch
+                total_token_including_padding -= tokens_including_padding_in_batch
+                skipped_oom_batches += 1
+                with contextlib.suppress(Exception):
+                    optimizer.zero_grad()
+                with contextlib.suppress(Exception):
+                    model.zero_grad()
+                with contextlib.suppress(Exception):
+                    torch.cuda.empty_cache()
+                continue
+
+            if loss is None:
+                raise RuntimeError("Loss is None after forward pass without OOM.")
+
+            # Backward is done after OOM synchronization.
+            # This prevents other ranks from entering NCCL collectives when one rank already hit OOM in forward.
+            if not loss_already_backwarded:
+                try:
                     accelerator.backward(loss)
-                # clip gradient norm. don't do this with deepspeed
-                if accelerator.sync_gradients and args.clip_grad_norm > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                lr_scheduler.step()
+                except (torch.OutOfMemoryError, RuntimeError) as exc:
+                    if _is_cuda_oom_error(exc):
+                        raise RuntimeError(
+                            "CUDA OOM occurred during backward. "
+                            "Skipping is not safe once distributed collectives may have started; "
+                            "reduce per-device batch/sequence length."
+                        ) from exc
+                    raise
+                if profile_this_step:
+                    _log_memory_profile("after_backward", batch, completed_steps + 1)
+            elif profile_this_step:
+                _log_memory_profile("after_backward", batch, completed_steps + 1)
+
+            # We keep track of the loss at each logged step
+            total_loss += loss.detach().float()
+            # clip gradient norm. don't do this with deepspeed
+            if accelerator.sync_gradients and args.clip_grad_norm > 0:
+                accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+            lr_scheduler.step()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1033,6 +1206,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                         accelerator.print(f"{metrics_to_log=}")
                     if args.with_tracking:
                         accelerator.log(metrics_to_log, step=completed_steps)
+                        if skipped_oom_batches:
+                            accelerator.log({"skipped_oom_batches": skipped_oom_batches}, step=completed_steps)
                     maybe_update_beaker_description(
                         current_step=completed_steps,
                         total_steps=args.max_train_steps,
