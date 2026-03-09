@@ -48,6 +48,7 @@ from transformers.training_args import _convert_str_dict
 
 from open_instruct import logger_utils, utils
 from open_instruct.dataset_transformation import (
+    ASSISTANT_HEADER_START_KEY,
     INPUT_IDS_KEY,
     TOKENIZED_SFT_DATASET_KEYS,
     TokenizerConfig,
@@ -76,6 +77,34 @@ from open_instruct.utils import (
 )
 
 logger = get_logger(__name__)
+
+
+class PrefillLowerDataCollator:
+    def __init__(self, *, tokenizer, model):
+        self.base_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        split_starts = []
+        stripped_features = []
+        for feature in features:
+            feature_dict = dict(feature)
+            split_start = feature_dict.pop(ASSISTANT_HEADER_START_KEY, None)
+            if split_start is not None:
+                if isinstance(split_start, torch.Tensor):
+                    split_start = int(split_start.item())
+                else:
+                    split_start = int(split_start)
+                if split_start < 0:
+                    split_start = None
+            split_starts.append(split_start)
+            stripped_features.append(feature_dict)
+
+        batch = self.base_collator(stripped_features)
+        if any(split_start is not None for split_start in split_starts):
+            if not all(split_start is not None for split_start in split_starts):
+                raise ValueError("assistant_header_start must be present for every example in a prefill-lower batch.")
+            batch[ASSISTANT_HEADER_START_KEY] = torch.tensor(split_starts, dtype=torch.long)
+        return batch
 
 
 @dataclass
@@ -242,6 +271,16 @@ class FlatArguments:
     llopa_no_upper_attn: bool = field(
         default=False, metadata={"help": "LLoPA decode optimization: skip upper-layer attention."}
     )
+    prefill_lower_layers: int = field(
+        default=0,
+        metadata={
+            "help": "Vanilla-compatible split path: prefill prompt tokens with lower K layers only, then decode the suffix with full layers."
+        },
+    )
+    prefill_lower_attn: str = field(
+        default="causal",
+        metadata={"help": "Prefill attention mode for prefill_lower_layers: causal or full."},
+    )
     skip_upper_attention_layers: int = field(
         default=0,
         metadata={"help": "For full-sequence training, preserve attention in the first K layers and skip attention above them."},
@@ -406,6 +445,14 @@ class FlatArguments:
                 raise ValueError("LLoPA path does not support packing.")
             if self.load_balancing_loss:
                 raise ValueError("LLoPA path does not support load_balancing_loss.")
+        if self.prefill_lower_layers < 0:
+            raise ValueError("prefill_lower_layers must be >= 0.")
+        if self.prefill_lower_attn not in {"causal", "full"}:
+            raise ValueError("prefill_lower_attn must be one of {'causal', 'full'}.")
+        if self.llopa and self.prefill_lower_layers > 0:
+            raise ValueError("prefill_lower_layers cannot be combined with --llopa.")
+        if self.skip_upper_attention_layers > 0 and self.prefill_lower_layers > 0:
+            raise ValueError("prefill_lower_layers cannot be combined with --skip_upper_attention_layers.")
         if self.llopa_modeling_path and self.lopa_modeling_path:
             if self.llopa_modeling_path != self.lopa_modeling_path:
                 raise ValueError(
@@ -552,7 +599,22 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     if needs_messages_for_sft_filter or args.use_single_only or args.llopa:
         if tc.sft_messages_key not in args.dataset_target_columns:
             args.dataset_target_columns = [*args.dataset_target_columns, tc.sft_messages_key]
-    needs_capsule_modeling = bool(args.llopa or args.skip_upper_attention_layers > 0)
+    prefill_lower_boundary_ready = any(
+        fn_name in {"sft_tulu_tokenize_and_truncate_v1", "last_turn_tulu_tokenize_and_truncate_v1"}
+        for fn_name in args.dataset_transform_fn
+    )
+    if (
+        args.prefill_lower_layers > 0
+        and prefill_lower_boundary_ready
+        and ASSISTANT_HEADER_START_KEY not in args.dataset_target_columns
+    ):
+        args.dataset_target_columns = [*args.dataset_target_columns, ASSISTANT_HEADER_START_KEY]
+    needs_capsule_modeling = bool(
+        args.llopa
+        or args.prefill_lower_layers > 0
+        or args.skip_upper_attention_layers > 0
+        or args.llopa_profile_memory_steps > 0
+    )
     if needs_capsule_modeling:
         if args.llopa_modeling_path:
             modeling_path = args.llopa_modeling_path
@@ -571,6 +633,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             logger.info(
                 "Full-sequence upper-attention skip enabled | skip_from_layer=%s | modeling=%s | family=%s",
                 args.skip_upper_attention_layers,
+                modeling_path,
+                args.modeling_family,
+            )
+        if args.prefill_lower_layers > 0:
+            logger.info(
+                "Vanilla-compatible prefill-lower path enabled | lower_k=%s | prefill_attn=%s | modeling=%s | family=%s",
+                args.prefill_lower_layers,
+                args.prefill_lower_attn,
                 modeling_path,
                 args.modeling_family,
             )
@@ -738,6 +808,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             system_prefill=str(args.llopa_system_prefill),
             user_prefill=str(args.llopa_user_prefill),
         )
+    elif args.prefill_lower_layers > 0:
+        collate_fn = PrefillLowerDataCollator(tokenizer=tokenizer, model=model)
     else:
         collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
 
@@ -921,7 +993,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             return
         system_len, user_len, assistant_len, sequence_len = _batch_profile_lengths(batch_data)
         logger.info(
-            "[LLOPA_MEM] step=%s rank=%s stage=%s system_len=%s user_len=%s assistant_len=%s sequence_len=%s "
+            "[LLOPA_MEM] step=%s rank=%s stage=%s peak_scope=since_reset system_len=%s user_len=%s assistant_len=%s sequence_len=%s "
             "allocated_GiB=%.3f reserved_GiB=%.3f max_allocated_GiB=%.3f max_reserved_GiB=%.3f",
             step,
             accelerator.process_index,
@@ -935,6 +1007,11 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             torch.cuda.max_memory_allocated(device=accelerator.device) / 2**30,
             torch.cuda.max_memory_reserved(device=accelerator.device) / 2**30,
         )
+
+    def _reset_memory_profile_peak() -> None:
+        if accelerator.device.type != "cuda":
+            return
+        torch.cuda.reset_peak_memory_stats(device=accelerator.device)
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
@@ -977,14 +1054,16 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             profile_this_step = bool(args.llopa_profile_memory_steps > 0 and completed_steps < args.llopa_profile_memory_steps)
             _set_llopa_profile_state(
                 model,
-                enabled=bool(profile_this_step and (args.llopa or args.skip_upper_attention_layers > 0)),
+                enabled=bool(profile_this_step),
                 step=completed_steps + 1,
             )
             if profile_this_step and accelerator.device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device=accelerator.device)
+                _reset_memory_profile_peak()
                 _log_memory_profile("batch_received", batch, completed_steps + 1)
             try:
                 with accelerator.accumulate(model):
+                    if profile_this_step:
+                        _reset_memory_profile_peak()
                     if args.llopa:
                         if using_stream_backward:
                             loss = compute_llopa_batch_loss_streaming_backward(
@@ -1021,6 +1100,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             **batch,
                             use_cache=False,
                             output_router_logits=True,
+                            prefill_lower_layers=int(args.prefill_lower_layers),
+                            prefill_lower_attn=str(args.prefill_lower_attn),
                             skip_upper_attention_layers=int(args.skip_upper_attention_layers),
                         )
                         total_aux_loss += outputs.aux_loss.detach().float()
@@ -1031,6 +1112,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                         outputs = model(
                             **batch,
                             use_cache=False,
+                            prefill_lower_layers=int(args.prefill_lower_layers),
+                            prefill_lower_attn=str(args.prefill_lower_attn),
                             skip_upper_attention_layers=int(args.skip_upper_attention_layers),
                         )
                         loss = outputs.loss
@@ -1080,6 +1163,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             # Backward is done after OOM synchronization.
             # This prevents other ranks from entering NCCL collectives when one rank already hit OOM in forward.
             if not loss_already_backwarded:
+                if profile_this_step:
+                    _reset_memory_profile_peak()
                 try:
                     accelerator.backward(loss)
                 except (torch.OutOfMemoryError, RuntimeError) as exc:
@@ -1100,9 +1185,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             # clip gradient norm. don't do this with deepspeed
             if accelerator.sync_gradients and args.clip_grad_norm > 0:
                 accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            if profile_this_step:
+                _reset_memory_profile_peak()
             optimizer.step()
             optimizer.zero_grad()
             lr_scheduler.step()
+            if profile_this_step:
+                _log_memory_profile("after_optimizer", batch, completed_steps + 1)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
