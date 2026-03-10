@@ -1122,9 +1122,22 @@ def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrained
     assert isinstance(input_ids_result, torch.Tensor)
     input_ids = input_ids_result
     labels = input_ids.clone()
-    assistant_header_start = -1
+    assistant_header_start = None
     # mask the non-assistant part for avoiding loss
     for message_idx, message in enumerate(messages):
+        if message["role"] == "assistant":
+            if message_idx == 0:
+                assistant_header_start = 0
+            else:
+                assistant_header_start = tokenizer.apply_chat_template(
+                    conversation=messages[:message_idx],
+                    tokenize=True,
+                    return_tensors="pt",
+                    padding=False,
+                    truncation=True,
+                    max_length=max_seq_length,
+                    add_generation_prompt=False,
+                ).shape[1]
         if message["role"] != "assistant":
             # we calculate the start index of this non-assistant message
             if message_idx == 0:
@@ -1182,7 +1195,7 @@ def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrained
     row[INPUT_IDS_KEY] = input_ids.flatten()
     row[LABELS_KEY] = labels.flatten()
     row[ATTENTION_MASK_KEY] = attention_mask.flatten()
-    row[ASSISTANT_HEADER_START_KEY] = int(assistant_header_start)
+    row[ASSISTANT_HEADER_START_KEY] = int(assistant_header_start) if assistant_header_start is not None else -1
     return row
 
 
@@ -1203,9 +1216,22 @@ def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreT
     assert isinstance(input_ids_result, torch.Tensor)
     input_ids = input_ids_result
     labels = input_ids.clone()
-    assistant_header_start = -1
+    assistant_header_start = None
     # mask all turns but the last for avoiding loss
     for message_idx, _message in enumerate(messages):
+        if message_idx == len(messages) - 1 and messages[message_idx].get("role") == "assistant":
+            if message_idx == 0:
+                assistant_header_start = 0
+            else:
+                assistant_header_start = tokenizer.apply_chat_template(
+                    conversation=messages[:message_idx],
+                    tokenize=True,
+                    return_tensors="pt",
+                    padding=False,
+                    truncation=True,
+                    max_length=max_seq_length,
+                    add_generation_prompt=False,
+                ).shape[1]
         if message_idx < len(messages) - 1:
             # we calculate the start index of this non-assistant message
             if message_idx == 0:
@@ -1263,7 +1289,7 @@ def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreT
     row[INPUT_IDS_KEY] = input_ids.flatten()
     row[LABELS_KEY] = labels.flatten()
     row[ATTENTION_MASK_KEY] = attention_mask.flatten()
-    row[ASSISTANT_HEADER_START_KEY] = int(assistant_header_start)
+    row[ASSISTANT_HEADER_START_KEY] = int(assistant_header_start) if assistant_header_start is not None else -1
     return row
 
 
