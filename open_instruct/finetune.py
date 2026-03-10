@@ -78,6 +78,14 @@ from open_instruct.utils import (
 logger = get_logger(__name__)
 
 
+def _infer_transformer_layers_pattern(model: torch.nn.Module) -> str:
+    for candidate in ("layers", "h", "blocks", "block"):
+        needle = f".{candidate}."
+        if any(name.startswith(f"{candidate}.") or needle in name for name, _ in model.named_modules()):
+            return candidate
+    raise ValueError("Unable to infer transformer layer pattern for train_upper_only LoRA placement.")
+
+
 @dataclass
 class FlatArguments:
     """
@@ -194,6 +202,15 @@ class FlatArguments:
     lora_rank: int = field(default=64, metadata={"help": "The rank of lora."})
     lora_alpha: float = field(default=16, metadata={"help": "The alpha parameter of lora."})
     lora_dropout: float = field(default=0.1, metadata={"help": "The dropout rate of lora modules."})
+    train_upper_only: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "If > 0 and use_lora=True, freeze the lowest K transformer blocks by applying LoRA only to "
+                "upper layers [K, num_hidden_layers)."
+            )
+        },
+    )
     lr_scheduler_type: str = field(
         default="linear",
         metadata={
@@ -219,6 +236,14 @@ class FlatArguments:
     )
     use_8bit_optimizer: bool = field(
         default=False, metadata={"help": "Use 8bit optimizer from bitsandbytes. Not compatible with deepspeed."}
+    )
+    prefill_lower_layers: int = field(
+        default=0,
+        metadata={"help": "If > 0, use the TRI prefill-lower training path with K lower layers."},
+    )
+    prefill_lower_attn: str = field(
+        default="causal",
+        metadata={"help": "Attention mode for TRI prefill-lower path: causal or full."},
     )
     llopa: bool = field(
         default=False,
@@ -387,6 +412,12 @@ class FlatArguments:
                 raise NotImplementedError("final_lr_ratio only currently implemented for linear schedulers")
             if not (1.0 >= self.final_lr_ratio >= 0.0):
                 raise ValueError(f"final_lr_ratio must be between 0 and 1, not {self.final_lr_ratio=}")
+        if self.prefill_lower_layers < 0:
+            raise ValueError("prefill_lower_layers must be >= 0.")
+        if self.prefill_lower_attn not in {"causal", "full"}:
+            raise ValueError("prefill_lower_attn must be one of {'causal', 'full'}.")
+        if self.prefill_lower_layers > 0 and self.packing:
+            raise ValueError("prefill_lower_layers path does not support packing.")
         if self.llopa:
             if self.llopa_prefill_mode != "lower":
                 raise ValueError("LLoPA currently requires llopa_prefill_mode='lower'.")
@@ -419,6 +450,9 @@ class FlatArguments:
 
 
 def main(args: FlatArguments, tc: TokenizerConfig):
+    if args.train_upper_only > 0 and not args.use_lora:
+        raise ValueError("train_upper_only currently requires --use_lora True.")
+
     # ------------------------------------------------------------
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -544,7 +578,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     if needs_messages_for_sft_filter or args.use_single_only or args.llopa:
         if tc.sft_messages_key not in args.dataset_target_columns:
             args.dataset_target_columns = [*args.dataset_target_columns, tc.sft_messages_key]
-    if args.llopa:
+    if args.llopa or args.prefill_lower_layers > 0:
         if args.llopa_modeling_path:
             modeling_path = args.llopa_modeling_path
         else:
@@ -556,7 +590,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             }.get(str(args.modeling_family or "llama").strip().lower(), "tri_llama3_modeling.py")
             modeling_path = str((repo_root / "Capsule" / default_name).resolve())
         install_llopa_modeling(modeling_path=modeling_path, model_family=args.modeling_family)
-        logger.info("LLoPA enabled | modeling=%s | family=%s", modeling_path, args.modeling_family)
+        logger.info(
+            "TRI modeling enabled | llopa=%s | prefill_lower_layers=%s | modeling=%s | family=%s",
+            args.llopa,
+            args.prefill_lower_layers,
+            modeling_path,
+            args.modeling_family,
+        )
 
     with accelerator.main_process_first():
         transform_fn_args = []
@@ -689,6 +729,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         embedding_size = embeddings.weight.shape[0]
 
     if args.use_lora:
+        if args.train_upper_only < 0:
+            raise ValueError(f"train_upper_only must be >= 0, got {args.train_upper_only}")
         if args.use_qlora:
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
         elif args.gradient_checkpointing:
@@ -696,7 +738,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             model.gradient_checkpointing_enable()
 
         logger.info("Initializing LORA model...")
-        peft_config = LoraConfig(
+        peft_config_kwargs = dict(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
             r=args.lora_rank,
@@ -704,6 +746,29 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             lora_dropout=args.lora_dropout,
             target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"],
         )
+        if args.train_upper_only > 0:
+            num_hidden_layers = getattr(config, "num_hidden_layers", None)
+            if num_hidden_layers is None:
+                raise ValueError("train_upper_only requires config.num_hidden_layers to be defined.")
+            if args.train_upper_only >= num_hidden_layers:
+                raise ValueError(
+                    f"train_upper_only={args.train_upper_only} leaves no trainable upper layers "
+                    f"(num_hidden_layers={num_hidden_layers})."
+                )
+            layers_pattern = _infer_transformer_layers_pattern(model)
+            layers_to_transform = list(range(args.train_upper_only, num_hidden_layers))
+            logger.info(
+                "Applying LoRA only to upper layers: freezing lower [%s, %s], training upper [%s, %s] via pattern '%s'.",
+                0,
+                args.train_upper_only - 1,
+                args.train_upper_only,
+                num_hidden_layers - 1,
+                layers_pattern,
+            )
+            peft_config_kwargs["layers_pattern"] = layers_pattern
+            peft_config_kwargs["layers_to_transform"] = layers_to_transform
+
+        peft_config = LoraConfig(**peft_config_kwargs)
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
     elif args.gradient_checkpointing:
@@ -878,6 +943,17 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
             with accelerator.accumulate(model):
                 loss_already_backwarded = False
+                model_batch = batch
+                if "assistant_header_start" in batch:
+                    model_batch = dict(batch)
+                    if args.prefill_lower_layers <= 0:
+                        model_batch.pop("assistant_header_start", None)
+
+                model_forward_kwargs = {"use_cache": False}
+                if args.prefill_lower_layers > 0:
+                    model_forward_kwargs["prefill_lower_layers"] = int(args.prefill_lower_layers)
+                    model_forward_kwargs["prefill_lower_attn"] = str(args.prefill_lower_attn)
+
                 if args.llopa:
                     if args.llopa_loss_scope == "all_assistant" and args.llopa_stream_backward:
                         loss = compute_llopa_batch_loss_streaming_backward(
@@ -910,13 +986,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             messages_key=tc.sft_messages_key,
                         )
                 elif args.load_balancing_loss:
-                    outputs = model(**batch, use_cache=False, output_router_logits=True)
+                    outputs = model(**model_batch, output_router_logits=True, **model_forward_kwargs)
                     total_aux_loss += outputs.aux_loss.detach().float()
                     loss = outputs.loss
                     del outputs
                 else:
                     # Standard forward pass
-                    outputs = model(**batch, use_cache=False)
+                    outputs = model(**model_batch, **model_forward_kwargs)
                     loss = outputs.loss
                     del outputs
 
