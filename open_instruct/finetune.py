@@ -88,6 +88,77 @@ def _infer_transformer_layers_pattern(model: torch.nn.Module) -> str:
     raise ValueError("Unable to infer transformer layer pattern for train_upper_only LoRA placement.")
 
 
+def _resolve_transformer_layer_container(
+    model: torch.nn.Module,
+) -> tuple[torch.nn.Module, str, torch.nn.ModuleList, str]:
+    candidates: list[tuple[torch.nn.Module, str, torch.nn.ModuleList, str]] = []
+    for root_name in ("model", "transformer", ""):
+        root = model if root_name == "" else getattr(model, root_name, None)
+        if not isinstance(root, torch.nn.Module):
+            continue
+        for layer_attr in ("layers", "h", "blocks", "block"):
+            layer_container = getattr(root, layer_attr, None)
+            if isinstance(layer_container, torch.nn.ModuleList):
+                qualified_name = f"{root_name}.{layer_attr}" if root_name else layer_attr
+                candidates.append((root, layer_attr, layer_container, qualified_name))
+    if not candidates:
+        raise ValueError("Unable to locate transformer layer container for no_upper_layers pruning.")
+    return candidates[0]
+
+
+def _prune_upper_layers_inplace(model: transformers.PreTrainedModel, keep_layers: int) -> None:
+    config = getattr(model, "config", None)
+    if config is None:
+        raise ValueError("no_upper_layers pruning requires model.config to be present.")
+    original_num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if original_num_hidden_layers is None:
+        raise ValueError("no_upper_layers pruning requires config.num_hidden_layers to be defined.")
+
+    original_num_hidden_layers = int(original_num_hidden_layers)
+    keep_layers = int(keep_layers)
+    if keep_layers <= 0:
+        raise ValueError(f"no_upper_layers requires keep_layers > 0, got {keep_layers}.")
+    if keep_layers > original_num_hidden_layers:
+        raise ValueError(
+            f"no_upper_layers requested keep_layers={keep_layers}, but model only has "
+            f"{original_num_hidden_layers} layers."
+        )
+
+    root_module, layer_attr, layer_container, qualified_name = _resolve_transformer_layer_container(model)
+    if len(layer_container) < keep_layers:
+        raise ValueError(
+            f"Layer container '{qualified_name}' has only {len(layer_container)} entries, "
+            f"cannot keep {keep_layers} layers."
+        )
+
+    if keep_layers < len(layer_container):
+        setattr(root_module, layer_attr, torch.nn.ModuleList(list(layer_container[:keep_layers])))
+    config.num_hidden_layers = keep_layers
+    setattr(config, "capsule_no_upper_layers", True)
+    setattr(config, "capsule_original_num_hidden_layers", original_num_hidden_layers)
+    setattr(config, "capsule_retained_num_hidden_layers", keep_layers)
+
+    base_model = getattr(model, "model", None)
+    if isinstance(base_model, torch.nn.Module) and getattr(base_model, "config", None) is not None:
+        base_model.config.num_hidden_layers = keep_layers
+        llopa_specials = getattr(base_model, "llopa_specials", None)
+        if isinstance(llopa_specials, torch.nn.ParameterList) and len(llopa_specials) > keep_layers:
+            base_model.llopa_specials = torch.nn.ParameterList(list(llopa_specials[:keep_layers]))
+
+    if keep_layers < original_num_hidden_layers:
+        logger.info(
+            "Enabled no_upper_layers: pruned model from %s to %s transformer layers via '%s'.",
+            original_num_hidden_layers,
+            keep_layers,
+            qualified_name,
+        )
+    else:
+        logger.info(
+            "Enabled no_upper_layers, but keep_layers=%s matches the full model depth; topology unchanged.",
+            keep_layers,
+        )
+
+
 class PrefillLowerDataCollator:
     def __init__(self, *, tokenizer, model):
         self.base_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
@@ -299,6 +370,13 @@ class FlatArguments:
         default="causal",
         metadata={"help": "Prefill attention mode for prefill_lower_layers: causal or full."},
     )
+    no_upper_layers: bool = field(
+        default=False,
+        metadata={
+            "help": "Physically prune all transformer blocks above prefill_lower_layers and train/save only the "
+            "retained lower stack plus lm_head."
+        },
+    )
     skip_upper_attention_layers: int = field(
         default=0,
         metadata={"help": "For full-sequence training, preserve attention in the first K layers and skip attention above them."},
@@ -458,6 +536,17 @@ class FlatArguments:
             raise ValueError("prefill_lower_attn must be one of {'causal', 'full'}.")
         if self.prefill_lower_layers > 0 and self.packing:
             raise ValueError("prefill_lower_layers path does not support packing.")
+        if self.no_upper_layers:
+            if self.prefill_lower_layers <= 0:
+                raise ValueError("no_upper_layers requires prefill_lower_layers > 0.")
+            if self.llopa:
+                raise ValueError("no_upper_layers cannot be combined with --llopa.")
+            if self.skip_upper_attention_layers > 0:
+                raise ValueError("no_upper_layers cannot be combined with --skip_upper_attention_layers.")
+            if self.use_lora:
+                raise ValueError("no_upper_layers currently requires full-model training (use_lora=False).")
+            if self.train_upper_only > 0:
+                raise ValueError("no_upper_layers cannot be combined with --train_upper_only.")
         if self.llopa:
             if self.llopa_prefill_mode != "lower":
                 raise ValueError("LLoPA currently requires llopa_prefill_mode='lower'.")
@@ -782,6 +871,9 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
+
+    if args.no_upper_layers:
+        _prune_upper_layers_inplace(model, keep_layers=int(args.prefill_lower_layers))
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
