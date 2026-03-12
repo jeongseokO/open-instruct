@@ -74,6 +74,7 @@ from open_instruct.utils import (
     maybe_update_beaker_description,
     maybe_use_ai2_hf_entity,
     maybe_use_ai2_wandb_entity,
+    truncate_wandb_tag,
 )
 
 logger = get_logger(__name__)
@@ -582,7 +583,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 "wandb": {
                     "name": args.exp_name,
                     "entity": args.wandb_entity,
-                    "tags": [args.exp_name] + get_wandb_tags(),
+                    "tags": [truncate_wandb_tag(args.exp_name)] + get_wandb_tags(),
                 }
             },
         )

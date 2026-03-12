@@ -762,6 +762,21 @@ def get_git_commit() -> str:
     return os.environ.get("GIT_COMMIT", "unknown")
 
 
+def truncate_wandb_tag(tag: str, limit: int = 64) -> str:
+    """Clip W&B tags to the service limit while preserving some suffix context."""
+    tag = str(tag)
+    if len(tag) <= limit:
+        return tag
+    if limit <= 3:
+        return tag[:limit]
+    keep = limit - 3
+    head = min(48, keep)
+    tail = keep - head
+    if tail <= 0:
+        return tag[:limit]
+    return f"{tag[:head]}...{tag[-tail:]}"
+
+
 def get_wandb_tags() -> list[str]:
     """Get tags for Weights & Biases (e.g., `no-tag-404-g98dc659,pr-123,branch-main`)"""
     tags = [t for t in os.environ.get("WANDB_TAGS", "").split(",") if t != ""]
@@ -778,7 +793,7 @@ def get_wandb_tags() -> list[str]:
             logger.warning(f"Failed to get PR number from GitHub API: {e}.")
     if "GIT_BRANCH" in os.environ:
         tags.append(f"branch: {os.environ['GIT_BRANCH']}")
-    tags = [tag[:64] for tag in tags]
+    tags = [truncate_wandb_tag(tag) for tag in tags]
     return tags
 
 
