@@ -75,6 +75,15 @@ from open_instruct.utils import hf_whoami, max_num_processes
 logger = logger_utils.setup_logger(__name__)
 
 
+def _apply_system_prompt_override(messages: list[dict[str, Any]], system_prompt_override: str | None) -> list[dict[str, Any]]:
+    if not system_prompt_override:
+        return messages
+    updated = copy.deepcopy(messages)
+    if updated and updated[0].get("role") == "system":
+        updated = updated[1:]
+    return [{"role": "system", "content": system_prompt_override}] + updated
+
+
 # ----------------------------------------------------------------------------
 # Utilities
 def get_commit_hash(
@@ -118,6 +127,18 @@ FILTER_EXAMPLE_PER_SECOND_PER_CPU = 1130
 def get_num_proc(dataset_len: int, num_available_cpus: int, example_per_second_per_cpu) -> int:
     num_required_cpus = max(1, dataset_len // example_per_second_per_cpu)
     return min(num_required_cpus, num_available_cpus, dataset_len)
+
+
+def _load_chat_template_from_tokenizer(tokenizer_name_or_path: str, revision: str | None) -> str:
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, revision=revision)
+    except Exception:
+        raise ValueError(f"Could not load tokenizer chat template from {tokenizer_name_or_path}.") from None
+
+    chat_template = str(getattr(tokenizer, "chat_template", "") or "")
+    if not chat_template.strip():
+        raise ValueError(f"Tokenizer {tokenizer_name_or_path} does not define a chat template.")
+    return chat_template
 
 
 COLORS = ["on red", "on green", "on blue", "on yellow", "on magenta"]
@@ -683,15 +704,13 @@ def get_tokenizer_tulu_v1(tc: "TokenizerConfig"):
     # set the tokenizer chat template to the training format
     # this will be used for encoding the training examples
     # and saved together with the tokenizer to be used later.
-    if tc.chat_template_name in CHAT_TEMPLATES:
+    if tc.chat_template_source_name_or_path:
+        source_revision = tc.chat_template_source_revision or tc.tokenizer_revision
+        tokenizer.chat_template = _load_chat_template_from_tokenizer(tc.chat_template_source_name_or_path, source_revision)
+    elif tc.chat_template_name in CHAT_TEMPLATES:
         tokenizer.chat_template = CHAT_TEMPLATES[tc.chat_template_name]
     else:
-        try:
-            tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
-            ).chat_template
-        except Exception:
-            raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
+        tokenizer.chat_template = _load_chat_template_from_tokenizer(tc.tokenizer_name_or_path, tc.tokenizer_revision)
 
     if tc.add_bos:
         if tokenizer.chat_template.startswith("{{ bos_token }}") or (
@@ -749,13 +768,11 @@ def get_tokenizer_tulu_v2_1(tc: "TokenizerConfig"):
     # set the tokenizer chat template to the training format
     # this will be used for encoding the training examples
     # and saved together with the tokenizer to be used later.
-    if tc.chat_template_name is None:
-        try:
-            tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
-            ).chat_template
-        except Exception:
-            raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
+    if tc.chat_template_source_name_or_path:
+        source_revision = tc.chat_template_source_revision or tc.tokenizer_revision
+        tokenizer.chat_template = _load_chat_template_from_tokenizer(tc.chat_template_source_name_or_path, source_revision)
+    elif tc.chat_template_name is None:
+        tokenizer.chat_template = _load_chat_template_from_tokenizer(tc.tokenizer_name_or_path, tc.tokenizer_revision)
     elif tc.chat_template_name in CHAT_TEMPLATES:
         tokenizer.chat_template = CHAT_TEMPLATES[tc.chat_template_name]
     else:
@@ -830,15 +847,13 @@ def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
     # set the tokenizer chat template to the training format
     # this will be used for encoding the training examples
     # and saved together with the tokenizer to be used later.
-    if tc.chat_template_name in CHAT_TEMPLATES:
+    if tc.chat_template_source_name_or_path:
+        source_revision = tc.chat_template_source_revision or tc.tokenizer_revision
+        tokenizer.chat_template = _load_chat_template_from_tokenizer(tc.chat_template_source_name_or_path, source_revision)
+    elif tc.chat_template_name in CHAT_TEMPLATES:
         tokenizer.chat_template = CHAT_TEMPLATES[tc.chat_template_name]
     else:
-        try:
-            tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
-            ).chat_template
-        except Exception:
-            raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
+        tokenizer.chat_template = _load_chat_template_from_tokenizer(tc.tokenizer_name_or_path, tc.tokenizer_revision)
 
     if tc.add_bos:
         if tokenizer.chat_template.startswith("{{ bos_token }}") or (
@@ -873,6 +888,8 @@ class TokenizerConfig:
     trust_remote_code: bool = False
     use_fast: bool = True
     chat_template_name: str | None = None  # default to using the tokenizer chat template
+    chat_template_source_name_or_path: str | None = None
+    chat_template_source_revision: str | None = None
     add_bos: bool = False
     get_tokenizer_fn: str = "get_tokenizer_tulu_v2_2"
 
@@ -920,6 +937,8 @@ INPUT_IDS_KEY = "input_ids"
 ATTENTION_MASK_KEY = "attention_mask"
 LABELS_KEY = "labels"
 ASSISTANT_HEADER_START_KEY = "assistant_header_start"
+ASSISTANT_HEADER_STARTS_KEY = "assistant_header_starts"
+ASSISTANT_HEADER_START_MASK_KEY = "assistant_header_start_mask"
 DATASET_ORIGIN_KEY = "dataset_source"  # just 'dataset' clashes with RLVR stuff (see VERIFIER_SOURCE_KEY)
 TOKENIZED_SFT_DATASET_KEYS = [INPUT_IDS_KEY, ATTENTION_MASK_KEY, LABELS_KEY]
 TOKENIZED_SFT_DATASET_KEYS_WITH_SOURCE = [INPUT_IDS_KEY, ATTENTION_MASK_KEY, LABELS_KEY, DATASET_ORIGIN_KEY]
@@ -940,8 +959,8 @@ TOOLS_COLUMN_KEY = "tools"
 ENV_CONFIG_KEY = "env_config"
 
 # Cache version: increment this when transformation logic changes significantly
-# to invalidate old caches. v5: Normalized env_config into canonical payloads in preprocessing.
-DATASET_CACHE_VERSION = "v5"
+# to invalidate old caches. v6: Record per-turn assistant header metadata for unified multi-turn LLoPA.
+DATASET_CACHE_VERSION = "v6"
 
 
 def _normalize_env_config_column(row: dict[str, Any]) -> None:
@@ -1105,9 +1124,70 @@ def sft_filter_v1(
     return max_prompt_token_length_ok and max_token_length_ok and (contain_some_labels or not need_contain_labels)
 
 
-def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
+def _chat_template_token_count(
+    tokenizer: PreTrainedTokenizer,
+    messages: list[dict[str, Any]],
+    *,
+    max_seq_length: int,
+    add_generation_prompt: bool = False,
+) -> int:
+    tokenized = tokenizer.apply_chat_template(
+        conversation=messages,
+        tokenize=True,
+        return_tensors="pt",
+        padding=False,
+        truncation=True,
+        max_length=max_seq_length,
+        add_generation_prompt=add_generation_prompt,
+    )
+    assert isinstance(tokenized, torch.Tensor)
+    return int(tokenized.shape[1])
+
+
+def _collect_valid_assistant_header_starts(
+    messages: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizer,
+    *,
+    max_seq_length: int,
+    labels: torch.Tensor,
+) -> list[int]:
+    if labels.dim() != 2 or labels.size(0) != 1:
+        raise ValueError("labels must be rank-2 with batch size 1 when collecting assistant turn metadata.")
+
+    seq_len = int(labels.size(1))
+    valid_starts: list[int] = []
+    for message_idx, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        start = 0 if message_idx == 0 else _chat_template_token_count(
+            tokenizer,
+            messages[:message_idx],
+            max_seq_length=max_seq_length,
+            add_generation_prompt=False,
+        )
+        end = _chat_template_token_count(
+            tokenizer,
+            messages[: message_idx + 1],
+            max_seq_length=max_seq_length,
+            add_generation_prompt=False,
+        )
+        start = min(max(int(start), 0), seq_len)
+        end = min(max(int(end), 0), seq_len)
+        if end <= start:
+            continue
+        if bool((labels[0, start:end] != -100).any().item()):
+            valid_starts.append(start)
+    return valid_starts
+
+
+def sft_tulu_tokenize_and_truncate_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    system_prompt_override: str | None = None,
+):
     """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
-    messages = row["messages"]
+    messages = _apply_system_prompt_override(row["messages"], system_prompt_override)
     if len(messages) == 0:
         raise ValueError("messages field is empty.")
     input_ids_result = tokenizer.apply_chat_template(
@@ -1196,12 +1276,24 @@ def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrained
     row[LABELS_KEY] = labels.flatten()
     row[ATTENTION_MASK_KEY] = attention_mask.flatten()
     row[ASSISTANT_HEADER_START_KEY] = int(assistant_header_start) if assistant_header_start is not None else -1
+    row[ASSISTANT_HEADER_STARTS_KEY] = _collect_valid_assistant_header_starts(
+        messages,
+        tokenizer,
+        max_seq_length=max_seq_length,
+        labels=labels,
+    )
+    row["messages"] = messages
     return row
 
 
-def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
+def last_turn_tulu_tokenize_and_truncate_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    system_prompt_override: str | None = None,
+):
     """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
-    messages = row["messages"]
+    messages = _apply_system_prompt_override(row["messages"], system_prompt_override)
     if len(messages) == 0:
         raise ValueError("messages field is empty.")
     input_ids_result = tokenizer.apply_chat_template(
@@ -1290,6 +1382,13 @@ def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreT
     row[LABELS_KEY] = labels.flatten()
     row[ATTENTION_MASK_KEY] = attention_mask.flatten()
     row[ASSISTANT_HEADER_START_KEY] = int(assistant_header_start) if assistant_header_start is not None else -1
+    row[ASSISTANT_HEADER_STARTS_KEY] = _collect_valid_assistant_header_starts(
+        messages,
+        tokenizer,
+        max_seq_length=max_seq_length,
+        labels=labels,
+    )
+    row["messages"] = messages
     return row
 
 

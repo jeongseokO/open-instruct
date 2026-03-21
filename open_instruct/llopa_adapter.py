@@ -20,6 +20,7 @@ LLOPA_USER_MASK_KEY = "llopa_user_attention_mask"
 LLOPA_ASSISTANT_IDS_KEY = "llopa_assistant_ids"
 LLOPA_ASSISTANT_MASK_KEY = "llopa_assistant_attention_mask"
 LLOPA_LABELS_KEY = "llopa_labels"
+PREFILL_LOWER_SYSTEM_LEN_KEY = "prefill_lower_system_len"
 _WARNED_BATCHED_LAST_TURN_FALLBACK = False
 
 
@@ -145,6 +146,13 @@ def normalize_prompt_messages(messages: Any) -> list[dict[str, str]]:
     return out
 
 
+def normalize_system_prefill(system_prefill: str) -> str:
+    mode = (system_prefill or "full").strip().lower()
+    if mode not in {"full", "no_system", "no_bos_system"}:
+        return "full"
+    return mode
+
+
 def _apply_chat_template(tokenizer, messages: list[dict[str, str]], add_generation_prompt: bool) -> str:
     try:
         return tokenizer.apply_chat_template(
@@ -192,7 +200,7 @@ def _assistant_content_delta(tokenizer, prefix_messages: list[dict[str, str]], a
 
 
 def _llopa_split_system(system_ids: torch.Tensor, system_prefill: str):
-    mode = (system_prefill or "full").strip().lower()
+    mode = normalize_system_prefill(system_prefill)
     if mode == "full":
         return system_ids, system_ids[:, :0]
     if mode == "no_system":
@@ -210,6 +218,77 @@ def _llopa_merge_user(system_ids: torch.Tensor, user_ids: torch.Tensor, system_p
     else:
         user_llopa = user_ids
     return sys_upper, user_llopa
+
+
+def get_prefill_lower_system_len(
+    tokenizer,
+    sample_messages: Any,
+    *,
+    split_start: int | None = None,
+    sequence_len: int | None = None,
+) -> int:
+    """Return the retained system-prefix length for prefill_lower examples.
+
+    This mirrors LLoPA's prompt segmentation: only a leading system segment is
+    treated as "system", and the count is clamped to the tokenized sample's
+    retained prefix so right-side truncation cannot overrun the batch tensors.
+    """
+
+    device = torch.device("cpu")
+    msgs = normalize_prompt_messages(sample_messages)
+    assistant_turns = [i for i, message in enumerate(msgs) if message.get("role") == "assistant"]
+    if not assistant_turns:
+        return 0
+
+    turn_idx = assistant_turns[-1]
+    prefix_msgs = msgs[:turn_idx]
+    _, system_ids, _, _, _ = _build_segments(tokenizer, prefix_msgs, device)
+    system_len = int(system_ids.size(1))
+    if split_start is not None and int(split_start) >= 0:
+        system_len = min(system_len, int(split_start))
+    if sequence_len is not None and int(sequence_len) >= 0:
+        system_len = min(system_len, int(sequence_len))
+    return max(system_len, 0)
+
+
+def build_prefill_lower_upper_indices(
+    *,
+    sequence_len: int,
+    split_start: int,
+    system_len: int,
+    system_prefill: str,
+    device,
+) -> torch.LongTensor:
+    """Indices visible to upper layers in the prefill_lower path.
+
+    `full` keeps the full retained system prefix, `no_system` keeps only the
+    first system token (typically BOS), and `no_bos_system` drops the system
+    prefix entirely. In all modes, the assistant decode phase starts at
+    `split_start` and is always visible to upper layers.
+    """
+
+    total_len = max(int(sequence_len), 0)
+    split_start = min(max(int(split_start), 0), total_len)
+    system_len = min(max(int(system_len), 0), split_start)
+    mode = normalize_system_prefill(system_prefill)
+
+    if mode == "full":
+        prefix_keep = system_len
+    elif mode == "no_system":
+        prefix_keep = min(system_len, 1)
+    else:
+        prefix_keep = 0
+
+    pieces: list[torch.LongTensor] = []
+    if prefix_keep > 0:
+        pieces.append(torch.arange(0, prefix_keep, device=device, dtype=torch.long))
+    if split_start < total_len:
+        pieces.append(torch.arange(split_start, total_len, device=device, dtype=torch.long))
+    if not pieces:
+        return torch.empty((0,), device=device, dtype=torch.long)
+    if len(pieces) == 1:
+        return pieces[0]
+    return torch.cat(pieces, dim=0)
 
 
 def _pad_segment_batch(tensors: list[torch.Tensor], pad_value: int):

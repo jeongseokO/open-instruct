@@ -46,6 +46,13 @@ def _sample_messages_2():
     ]
 
 
+def _sample_messages_no_system():
+    return [
+        {"role": "user", "content": "question only"},
+        {"role": "assistant", "content": "answer only"},
+    ]
+
+
 def _base_batch(messages_batch):
     batch_size = len(messages_batch)
     return {
@@ -172,3 +179,66 @@ def test_compute_llopa_batch_loss_warns_once_when_batched_tensors_missing(monkey
 
     assert len(warnings) == 1
     assert "prebatched segment tensors" in warnings[0]
+
+
+def test_get_prefill_lower_system_len_matches_tokenized_system_prefix():
+    tokenizer = DummyTokenizer()
+    expected = llopa_adapter._tokens_from_messages(
+        tokenizer,
+        [{"role": "system", "content": "system prompt"}],
+        torch.device("cpu"),
+        add_generation_prompt=False,
+    ).size(1)
+
+    system_len = llopa_adapter.get_prefill_lower_system_len(
+        tokenizer,
+        _sample_messages(),
+        split_start=999,
+        sequence_len=999,
+    )
+    clamped = llopa_adapter.get_prefill_lower_system_len(
+        tokenizer,
+        _sample_messages(),
+        split_start=3,
+        sequence_len=999,
+    )
+    no_system = llopa_adapter.get_prefill_lower_system_len(
+        tokenizer,
+        _sample_messages_no_system(),
+        split_start=999,
+        sequence_len=999,
+    )
+
+    assert system_len == expected
+    assert clamped == 3
+    assert no_system == 0
+
+
+def test_build_prefill_lower_upper_indices_supports_system_prefill_modes():
+    device = torch.device("cpu")
+
+    full_idx = llopa_adapter.build_prefill_lower_upper_indices(
+        sequence_len=10,
+        split_start=7,
+        system_len=4,
+        system_prefill="full",
+        device=device,
+    )
+    no_system_idx = llopa_adapter.build_prefill_lower_upper_indices(
+        sequence_len=10,
+        split_start=7,
+        system_len=4,
+        system_prefill="no_system",
+        device=device,
+    )
+    no_bos_idx = llopa_adapter.build_prefill_lower_upper_indices(
+        sequence_len=10,
+        split_start=7,
+        system_len=4,
+        system_prefill="no_bos_system",
+        device=device,
+    )
+
+    assert torch.equal(full_idx, torch.tensor([0, 1, 2, 3, 7, 8, 9], dtype=torch.long))
+    assert torch.equal(no_system_idx, torch.tensor([0, 7, 8, 9], dtype=torch.long))
+    assert torch.equal(no_bos_idx, torch.tensor([7, 8, 9], dtype=torch.long))

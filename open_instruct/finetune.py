@@ -49,6 +49,8 @@ from transformers.training_args import _convert_str_dict
 from open_instruct import logger_utils, utils
 from open_instruct.dataset_transformation import (
     ASSISTANT_HEADER_START_KEY,
+    ASSISTANT_HEADER_START_MASK_KEY,
+    ASSISTANT_HEADER_STARTS_KEY,
     INPUT_IDS_KEY,
     TOKENIZED_SFT_DATASET_KEYS,
     TokenizerConfig,
@@ -57,9 +59,12 @@ from open_instruct.dataset_transformation import (
 )
 from open_instruct.llopa_adapter import (
     LLOPADataCollator,
+    PREFILL_LOWER_SYSTEM_LEN_KEY,
     compute_llopa_batch_loss,
     compute_llopa_batch_loss_streaming_backward,
+    get_prefill_lower_system_len,
     install_llopa_modeling,
+    normalize_system_prefill,
 )
 from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
 from open_instruct.padding_free_collator import TensorDataCollatorWithFlattening
@@ -159,16 +164,91 @@ def _prune_upper_layers_inplace(model: transformers.PreTrainedModel, keep_layers
         )
 
 
+def _unwrap_model_for_metadata(model: torch.nn.Module) -> torch.nn.Module:
+    current = model
+    if hasattr(current, "module"):
+        current = current.module
+    return current
+
+
+def _iter_model_configs(model: torch.nn.Module):
+    seen: set[int] = set()
+    queue = [_unwrap_model_for_metadata(model)]
+    while queue:
+        current = queue.pop(0)
+        if current is None:
+            continue
+        config = getattr(current, "config", None)
+        if config is not None and id(config) not in seen:
+            seen.add(id(config))
+            yield config
+        for attr in ("model", "base_model", "language_model"):
+            child = getattr(current, attr, None)
+            if isinstance(child, torch.nn.Module):
+                queue.append(child)
+        get_base_model = getattr(current, "get_base_model", None)
+        if callable(get_base_model):
+            with contextlib.suppress(Exception):
+                base = get_base_model()
+                if isinstance(base, torch.nn.Module):
+                    queue.append(base)
+
+
+def _set_capsule_runtime_metadata(model: torch.nn.Module, args) -> None:
+    if not bool(getattr(args, "unified_llopa", False)):
+        return
+    for config in _iter_model_configs(model):
+        setattr(config, "capsule_llopa_enabled", True)
+        setattr(config, "capsule_lower_layers", int(args.lower_layers))
+        setattr(config, "capsule_prefill_mode", str(args.prefill_mode))
+        setattr(config, "capsule_prefill_attn", str(args.prefill_attn))
+        setattr(config, "capsule_system_prefill", str(args.system_prefill))
+        setattr(config, "capsule_user_prefill", str(args.user_prefill))
+        setattr(config, "capsule_no_upper_attn", bool(args.no_upper_attn))
+
+
+def _write_capsule_tri_info(output_dir: str, args) -> None:
+    if not output_dir or not bool(getattr(args, "unified_llopa", False)):
+        return
+    lines = [
+        f"lower_k={int(args.lower_layers)}",
+        f"prefill_mode={str(args.prefill_mode)}",
+        f"prefill_attn={str(args.prefill_attn)}",
+        f"system_prefill={str(args.system_prefill)}",
+        f"user_prefill={str(args.user_prefill)}",
+        f"no_upper_attn={int(bool(args.no_upper_attn))}",
+        "capsule_llopa_enabled=1",
+    ]
+    with open(os.path.join(output_dir, "tri_info.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _maybe_suffix_exp_name_for_system_prefill(args) -> None:
+    if not bool(getattr(args, "unified_llopa", False)):
+        return
+    normalized_system_prefill = normalize_system_prefill(str(args.system_prefill))
+    args.system_prefill = normalized_system_prefill
+    if normalized_system_prefill == "no_system" and not str(args.exp_name).endswith("-no_system"):
+        args.exp_name = f"{args.exp_name}-no_system"
+
+
 class PrefillLowerDataCollator:
-    def __init__(self, *, tokenizer, model):
+    def __init__(self, *, tokenizer, model, messages_key: str = "messages", system_prefill: str = "no_bos_system"):
         self.base_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
+        self.tokenizer = tokenizer
+        self.messages_key = messages_key
+        self.system_prefill = normalize_system_prefill(system_prefill)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         split_starts = []
+        assistant_turn_starts = []
+        system_lens = []
         stripped_features = []
         for feature in features:
             feature_dict = dict(feature)
             split_start = feature_dict.pop(ASSISTANT_HEADER_START_KEY, None)
+            turn_starts = feature_dict.pop(ASSISTANT_HEADER_STARTS_KEY, None)
+            messages = feature_dict.pop(self.messages_key, None)
             if split_start is not None:
                 if isinstance(split_start, torch.Tensor):
                     split_start = int(split_start.item())
@@ -177,6 +257,28 @@ class PrefillLowerDataCollator:
                 if split_start < 0:
                     split_start = None
             split_starts.append(split_start)
+            if turn_starts is None:
+                assistant_turn_starts.append(None)
+            else:
+                if isinstance(turn_starts, torch.Tensor):
+                    turn_starts = turn_starts.tolist()
+                turn_starts = [int(v) for v in list(turn_starts) if int(v) >= 0]
+                assistant_turn_starts.append(turn_starts)
+            system_len = 0
+            if messages is not None and self.system_prefill in {"full", "no_system"}:
+                raw_input_ids = feature_dict.get("input_ids")
+                sequence_len = None
+                if isinstance(raw_input_ids, torch.Tensor):
+                    sequence_len = int(raw_input_ids.numel())
+                elif raw_input_ids is not None:
+                    sequence_len = int(len(raw_input_ids))
+                system_len = get_prefill_lower_system_len(
+                    self.tokenizer,
+                    messages,
+                    split_start=split_start,
+                    sequence_len=sequence_len,
+                )
+            system_lens.append(system_len)
             stripped_features.append(feature_dict)
 
         batch = self.base_collator(stripped_features)
@@ -184,6 +286,21 @@ class PrefillLowerDataCollator:
             if not all(split_start is not None for split_start in split_starts):
                 raise ValueError("assistant_header_start must be present for every example in a prefill-lower batch.")
             batch[ASSISTANT_HEADER_START_KEY] = torch.tensor(split_starts, dtype=torch.long)
+        if any(turn_starts is not None for turn_starts in assistant_turn_starts):
+            if not all(turn_starts is not None for turn_starts in assistant_turn_starts):
+                raise ValueError("assistant_header_starts must be present for every example in a prefill-lower batch.")
+            max_turns = max((len(turn_starts) for turn_starts in assistant_turn_starts), default=0)
+            padded_turn_starts = torch.full((len(assistant_turn_starts), max_turns), -1, dtype=torch.long)
+            turn_mask = torch.zeros((len(assistant_turn_starts), max_turns), dtype=torch.bool)
+            for row_idx, turn_starts in enumerate(assistant_turn_starts):
+                width = len(turn_starts)
+                if width <= 0:
+                    continue
+                padded_turn_starts[row_idx, :width] = torch.tensor(turn_starts, dtype=torch.long)
+                turn_mask[row_idx, :width] = True
+            batch[ASSISTANT_HEADER_STARTS_KEY] = padded_turn_starts
+            batch[ASSISTANT_HEADER_START_MASK_KEY] = turn_mask
+        batch[PREFILL_LOWER_SYSTEM_LEN_KEY] = torch.tensor(system_lens, dtype=torch.long)
         return batch
 
 
@@ -286,6 +403,10 @@ class FlatArguments:
             )
         },
     )
+    system_prompt_override: str | None = field(
+        default="You are a helpful assistant.",
+        metadata={"help": "Replace/prepend every SFT sample's leading system message with this prompt."},
+    )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
@@ -338,6 +459,34 @@ class FlatArguments:
     use_8bit_optimizer: bool = field(
         default=False, metadata={"help": "Use 8bit optimizer from bitsandbytes. Not compatible with deepspeed."}
     )
+    unified_llopa: bool = field(
+        default=False,
+        metadata={"help": "Enable the unified direct-compatible LLoPA training path."},
+    )
+    lower_layers: int = field(
+        default=0,
+        metadata={"help": "Number of lower layers K used by unified LLoPA."},
+    )
+    prefill_mode: str = field(
+        default="lower",
+        metadata={"help": "Unified LLoPA prefill mode. Only 'lower' is currently supported."},
+    )
+    prefill_attn: str = field(
+        default="causal",
+        metadata={"help": "Unified LLoPA prefill attention mode: causal or full."},
+    )
+    system_prefill: str = field(
+        default="no_bos_system",
+        metadata={"help": "Unified LLoPA system-prefix visibility: full | no_system | no_bos_system."},
+    )
+    user_prefill: str = field(
+        default="full",
+        metadata={"help": "Unified LLoPA user prefill mode. Only 'full' is supported in the main path."},
+    )
+    no_upper_attn: bool = field(
+        default=False,
+        metadata={"help": "Unified LLoPA decode optimization: skip upper-layer attention."},
+    )
     llopa: bool = field(
         default=False,
         metadata={"help": "Enable Capsule LLoPA training path (system/user segmented prefill + assistant decode)."},
@@ -352,7 +501,13 @@ class FlatArguments:
         default="causal", metadata={"help": "LLoPA prefill attention mode: causal or full."}
     )
     llopa_system_prefill: str = field(
-        default="no_bos_system", metadata={"help": "LLoPA system prefill mode: full | no_system | no_bos_system."}
+        default="no_bos_system",
+        metadata={
+            "help": (
+                "System-prefix visibility policy for LLoPA and prefill_lower upper layers: "
+                "full | no_system | no_bos_system."
+            )
+        },
     )
     llopa_user_prefill: str = field(
         default="full", metadata={"help": "LLoPA user prefill mode: full | no_question."}
@@ -534,8 +689,35 @@ class FlatArguments:
             raise ValueError("prefill_lower_layers must be >= 0.")
         if self.prefill_lower_attn not in {"causal", "full"}:
             raise ValueError("prefill_lower_attn must be one of {'causal', 'full'}.")
+        if self.lower_layers < 0:
+            raise ValueError("lower_layers must be >= 0.")
+        if self.prefill_attn not in {"causal", "full"}:
+            raise ValueError("prefill_attn must be one of {'causal', 'full'}.")
+        self.llopa_system_prefill = normalize_system_prefill(self.llopa_system_prefill)
+        self.system_prefill = normalize_system_prefill(self.system_prefill)
         if self.prefill_lower_layers > 0 and self.packing:
             raise ValueError("prefill_lower_layers path does not support packing.")
+        if self.unified_llopa:
+            if self.lower_layers <= 0:
+                raise ValueError("unified_llopa requires lower_layers > 0.")
+            if self.prefill_mode != "lower":
+                raise NotImplementedError("unified_llopa currently requires prefill_mode='lower'.")
+            if self.llopa_loss_scope not in {"last_turn", "all_assistant"}:
+                raise ValueError("unified_llopa requires llopa_loss_scope in {'last_turn', 'all_assistant'}.")
+            if self.user_prefill != "full":
+                raise ValueError("unified_llopa currently supports only user_prefill='full'.")
+            if self.packing:
+                raise ValueError("unified_llopa does not support packing.")
+            if self.load_balancing_loss:
+                raise ValueError("unified_llopa does not support load_balancing_loss.")
+            if self.llopa:
+                raise ValueError("unified_llopa cannot be combined with legacy --llopa.")
+            if self.prefill_lower_layers > 0:
+                raise ValueError("unified_llopa cannot be combined with legacy --prefill_lower_layers.")
+            if self.skip_upper_attention_layers > 0:
+                raise ValueError("unified_llopa cannot be combined with --skip_upper_attention_layers.")
+            if self.no_upper_layers:
+                raise ValueError("unified_llopa cannot be combined with --no_upper_layers.")
         if self.no_upper_layers:
             if self.prefill_lower_layers <= 0:
                 raise ValueError("no_upper_layers requires prefill_lower_layers > 0.")
@@ -585,6 +767,7 @@ class FlatArguments:
 def main(args: FlatArguments, tc: TokenizerConfig):
     if args.train_upper_only > 0 and not args.use_lora:
         raise ValueError("train_upper_only currently requires --use_lora True.")
+    _maybe_suffix_exp_name_for_system_prefill(args)
 
     # ------------------------------------------------------------
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
@@ -621,6 +804,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                    is different from the model name `{args.model_name_or_path=}`."""
         logger.warning(warning)
     tokenizer = tc.tokenizer
+    if tc.chat_template_source_name_or_path:
+        logger.info(
+            "using chat template copied from %s (revision=%s) with tokenizer %s",
+            tc.chat_template_source_name_or_path,
+            tc.chat_template_source_revision or tc.tokenizer_revision,
+            tc.tokenizer_name_or_path,
+        )
 
     # ------------------------------------------------------------
     # Set up runtime variables
@@ -708,7 +898,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     # Keep raw messages whenever SFT filtering needs them.
     # This also enforces identical sample filtering between LLoPA and vanilla runs.
     needs_messages_for_sft_filter = "sft_tulu_filter_v1" in args.dataset_transform_fn
-    if needs_messages_for_sft_filter or args.use_single_only or args.llopa:
+    prefill_lower_needs_messages = bool(args.prefill_lower_layers > 0 or args.unified_llopa)
+    if needs_messages_for_sft_filter or args.use_single_only or args.llopa or prefill_lower_needs_messages:
         if tc.sft_messages_key not in args.dataset_target_columns:
             args.dataset_target_columns = [*args.dataset_target_columns, tc.sft_messages_key]
     prefill_lower_boundary_ready = any(
@@ -716,13 +907,20 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         for fn_name in args.dataset_transform_fn
     )
     if (
-        args.prefill_lower_layers > 0
+        prefill_lower_needs_messages
         and prefill_lower_boundary_ready
         and ASSISTANT_HEADER_START_KEY not in args.dataset_target_columns
     ):
         args.dataset_target_columns = [*args.dataset_target_columns, ASSISTANT_HEADER_START_KEY]
+    if (
+        args.unified_llopa
+        and prefill_lower_boundary_ready
+        and ASSISTANT_HEADER_STARTS_KEY not in args.dataset_target_columns
+    ):
+        args.dataset_target_columns = [*args.dataset_target_columns, ASSISTANT_HEADER_STARTS_KEY]
     needs_capsule_modeling = bool(
-        args.llopa
+        args.unified_llopa
+        or args.llopa
         or args.prefill_lower_layers > 0
         or args.skip_upper_attention_layers > 0
         or args.llopa_profile_memory_steps > 0
@@ -739,7 +937,19 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             }.get(str(args.modeling_family or "llama").strip().lower(), "tri_llama3_modeling.py")
             modeling_path = str((repo_root / "Capsule" / default_name).resolve())
         install_llopa_modeling(modeling_path=modeling_path, model_family=args.modeling_family)
+        if args.unified_llopa:
+            logger.info(
+                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | modeling=%s | family=%s",
+                args.lower_layers,
+                args.prefill_mode,
+                args.prefill_attn,
+                args.system_prefill,
+                args.no_upper_attn,
+                modeling_path,
+                args.modeling_family,
+            )
         if args.llopa:
+            logger.warning("Legacy --llopa path enabled. Prefer --unified_llopa for new training runs.")
             logger.info("LLoPA enabled | modeling=%s | family=%s", modeling_path, args.modeling_family)
         if args.skip_upper_attention_layers > 0:
             logger.info(
@@ -749,10 +959,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 args.modeling_family,
             )
         if args.prefill_lower_layers > 0:
+            logger.warning(
+                "Legacy --prefill_lower_layers path enabled. Prefer --unified_llopa for direct-compatible training."
+            )
             logger.info(
-                "Vanilla-compatible prefill-lower path enabled | lower_k=%s | prefill_attn=%s | modeling=%s | family=%s",
+                "Vanilla-compatible prefill-lower path enabled | lower_k=%s | prefill_attn=%s | system_prefill=%s | modeling=%s | family=%s",
                 args.prefill_lower_layers,
                 args.prefill_lower_attn,
+                args.llopa_system_prefill,
                 modeling_path,
                 args.modeling_family,
             )
@@ -761,7 +975,19 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         transform_fn_args = []
         for fn_name in args.dataset_transform_fn:
             if fn_name == "sft_tulu_tokenize_and_truncate_v1":
-                transform_fn_args.append({"max_seq_length": args.max_seq_length})
+                transform_fn_args.append(
+                    {
+                        "max_seq_length": args.max_seq_length,
+                        "system_prompt_override": args.system_prompt_override,
+                    }
+                )
+            elif fn_name == "last_turn_tulu_tokenize_and_truncate_v1":
+                transform_fn_args.append(
+                    {
+                        "max_seq_length": args.max_seq_length,
+                        "system_prompt_override": args.system_prompt_override,
+                    }
+                )
             elif fn_name == "sft_tulu_filter_v1":
                 filter_args = {
                     "use_single_only": bool(args.use_single_only),
@@ -787,10 +1013,15 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             dataset_skip_cache=args.dataset_skip_cache,
         )
         train_dataset = train_dataset.shuffle(seed=args.seed)
-        if args.use_single_only and not args.llopa and tc.sft_messages_key in train_dataset.column_names:
+        if args.use_single_only and not args.llopa and not prefill_lower_needs_messages and tc.sft_messages_key in train_dataset.column_names:
             train_dataset = train_dataset.remove_columns([tc.sft_messages_key])
-        if args.llopa:
-            train_dataset.set_format(type="pt", columns=TOKENIZED_SFT_DATASET_KEYS, output_all_columns=True)
+        if args.llopa or prefill_lower_needs_messages:
+            tensor_columns = list(TOKENIZED_SFT_DATASET_KEYS)
+            if ASSISTANT_HEADER_START_KEY in train_dataset.column_names:
+                tensor_columns.append(ASSISTANT_HEADER_START_KEY)
+            if ASSISTANT_HEADER_STARTS_KEY in train_dataset.column_names:
+                tensor_columns.append(ASSISTANT_HEADER_STARTS_KEY)
+            train_dataset.set_format(type="pt", columns=tensor_columns, output_all_columns=True)
         else:
             train_dataset.set_format(type="pt")
     if accelerator.is_main_process:
@@ -939,6 +1170,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     # DataLoaders creation:
     if args.packing:
         collate_fn = TensorDataCollatorWithFlattening()
+    elif args.unified_llopa:
+        collate_fn = PrefillLowerDataCollator(
+            tokenizer=tokenizer,
+            model=model,
+            messages_key=tc.sft_messages_key,
+            system_prefill=str(args.system_prefill),
+        )
     elif args.llopa:
         collate_fn = LLOPADataCollator(
             tokenizer=tokenizer,
@@ -949,7 +1187,12 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             user_prefill=str(args.llopa_user_prefill),
         )
     elif args.prefill_lower_layers > 0:
-        collate_fn = PrefillLowerDataCollator(tokenizer=tokenizer, model=model)
+        collate_fn = PrefillLowerDataCollator(
+            tokenizer=tokenizer,
+            model=model,
+            messages_key=tc.sft_messages_key,
+            system_prefill=str(args.llopa_system_prefill),
+        )
     else:
         collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
 
@@ -1204,7 +1447,18 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 with accelerator.accumulate(model):
                     if profile_this_step:
                         _reset_memory_profile_peak()
-                    if args.llopa:
+                    if args.unified_llopa:
+                        outputs = model(
+                            **batch,
+                            use_cache=False,
+                            prefill_lower_layers=int(args.lower_layers),
+                            prefill_lower_attn=str(args.prefill_attn),
+                            prefill_lower_system_prefill=str(args.system_prefill),
+                            prefill_lower_no_upper_attn=bool(args.no_upper_attn),
+                        )
+                        loss = outputs.loss
+                        del outputs
+                    elif args.llopa:
                         if using_stream_backward:
                             loss = compute_llopa_batch_loss_streaming_backward(
                                 model=model,
@@ -1242,6 +1496,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             output_router_logits=True,
                             prefill_lower_layers=int(args.prefill_lower_layers),
                             prefill_lower_attn=str(args.prefill_lower_attn),
+                            prefill_lower_system_prefill=str(args.llopa_system_prefill),
                             skip_upper_attention_layers=int(args.skip_upper_attention_layers),
                         )
                         total_aux_loss += outputs.aux_loss.detach().float()
@@ -1254,6 +1509,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             use_cache=False,
                             prefill_lower_layers=int(args.prefill_lower_layers),
                             prefill_lower_attn=str(args.prefill_lower_attn),
+                            prefill_lower_system_prefill=str(args.llopa_system_prefill),
                             skip_upper_attention_layers=int(args.skip_upper_attention_layers),
                         )
                         loss = outputs.loss
@@ -1472,10 +1728,22 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 clean_last_n_checkpoints(args.output_dir, args.keep_last_n_checkpoints)
             accelerator.wait_for_everyone()
 
+    _set_capsule_runtime_metadata(model, args)
+
     if args.output_dir is not None:
+        final_zero_checkpoint_dir = get_last_checkpoint_path(args) if bool(getattr(args, "unified_llopa", False)) else None
         save_with_accelerate(
-            accelerator, model, tokenizer, args.output_dir, args.use_lora, chat_template_name=tc.chat_template_name
+            accelerator,
+            model,
+            tokenizer,
+            args.output_dir,
+            args.use_lora,
+            chat_template_name=tc.chat_template_name,
+            zero3_checkpoint_dir=final_zero_checkpoint_dir,
+            prefer_zero3_offline_merge=bool(getattr(args, "unified_llopa", False)),
         )
+        if accelerator.is_main_process:
+            _write_capsule_tri_info(args.output_dir, args)
 
     # remove all checkpoints to save space
     if args.clean_checkpoints_at_end and accelerator.is_local_main_process:

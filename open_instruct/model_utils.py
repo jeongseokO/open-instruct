@@ -15,7 +15,9 @@
 
 
 import asyncio
+import gc
 import itertools
+import json
 import pathlib
 import tempfile
 from collections import OrderedDict, defaultdict
@@ -28,9 +30,9 @@ import pandas as pd
 import torch
 import transformers
 from accelerate import Accelerator
-from accelerate.state import AcceleratorState
+from accelerate.utils import DistributedType
 from deepspeed.runtime.engine import DeepSpeedEngine
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, split_torch_state_dict_into_shards
 from rich import print as rprint
 from rich.console import Console
 from rich.panel import Panel
@@ -46,6 +48,109 @@ else:  # pragma: no cover
     VerifierFunction = Any
 
 logger = logger_utils.setup_logger(__name__)
+
+
+def _normalize_torch_dtype(dtype: Any) -> torch.dtype | None:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        aliases = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }
+        return aliases.get(dtype.strip().lower())
+    return None
+
+
+def _infer_offline_save_dtype(model: torch.nn.Module) -> torch.dtype | None:
+    config_dtype = _normalize_torch_dtype(getattr(getattr(model, "config", None), "torch_dtype", None))
+    if config_dtype is not None:
+        return config_dtype
+    try:
+        first_param = next(model.parameters())
+    except StopIteration:
+        return None
+    return first_param.dtype if first_param.is_floating_point() else None
+
+
+def _target_dtype_for_lazy_tensor(tensor: Any, save_dtype: torch.dtype | None) -> torch.dtype:
+    tensor_dtype = getattr(tensor, "dtype", torch.float32)
+    probe = torch.empty((), dtype=tensor_dtype)
+    if save_dtype is not None and probe.is_floating_point():
+        return save_dtype
+    return tensor_dtype
+
+
+def _save_zero_checkpoint_with_dtype(
+    checkpoint_dir: str,
+    output_dir: str,
+    *,
+    save_dtype: torch.dtype | None,
+    max_shard_size: str = "5GB",
+) -> None:
+    state_dict = deepspeed.utils.zero_to_fp32.get_fp32_state_dict_from_zero_checkpoint(
+        checkpoint_dir,
+        lazy_mode=True,
+    )
+
+    empty_state_dict = {}
+    converted_tensors = {}
+    for name, tensor in state_dict.items():
+        tensor_id = id(tensor)
+        if tensor_id in converted_tensors:
+            empty_state_dict[name] = empty_state_dict[converted_tensors[tensor_id]]
+            continue
+        converted_tensors[tensor_id] = name
+        target_dtype = _target_dtype_for_lazy_tensor(tensor, save_dtype)
+        empty_state_dict[name] = torch.empty(tensor.shape, dtype=target_dtype)
+
+    filename_pattern = "pytorch_model{suffix}.bin"
+    state_dict_split = split_torch_state_dict_into_shards(
+        empty_state_dict,
+        filename_pattern=filename_pattern,
+        max_shard_size=max_shard_size,
+    )
+
+    output_path = pathlib.Path(output_dir)
+    for stale_file in output_path.glob("pytorch_model-*.bin"):
+        stale_file.unlink()
+    for stale_file in (
+        output_path / "pytorch_model.bin",
+        output_path / "pytorch_model.bin.index.json",
+    ):
+        stale_file.unlink(missing_ok=True)
+
+    for shard_file, tensor_names in state_dict_split.filename_to_tensors.items():
+        shard_state_dict = {}
+        materialized_tensors = {}
+        for tensor_name in tensor_names:
+            lazy_tensor = state_dict[tensor_name]
+            tensor_id = id(lazy_tensor)
+            if tensor_id in materialized_tensors:
+                shard_state_dict[tensor_name] = materialized_tensors[tensor_id]
+                continue
+            materialized = lazy_tensor.contiguous()
+            target_dtype = _target_dtype_for_lazy_tensor(lazy_tensor, save_dtype)
+            if materialized.dtype != target_dtype:
+                materialized = materialized.to(dtype=target_dtype)
+            shard_state_dict[tensor_name] = materialized
+            materialized_tensors[tensor_id] = materialized
+        torch.save(shard_state_dict, output_path / shard_file)
+        del shard_state_dict
+        del materialized_tensors
+        gc.collect()
+
+    if state_dict_split.is_sharded:
+        index = {
+            "metadata": state_dict_split.metadata,
+            "weight_map": state_dict_split.tensor_to_filename,
+        }
+        with open(output_path / "pytorch_model.bin.index.json", "w", encoding="utf-8") as f:
+            f.write(json.dumps(index, indent=2, sort_keys=True) + "\n")
 
 
 @dataclass
@@ -484,6 +589,8 @@ def save_with_accelerate(
     use_lora: bool = False,
     model_attribute_to_save: str | None = None,
     chat_template_name: str = "tulu",
+    zero3_checkpoint_dir: str | None = None,
+    prefer_zero3_offline_merge: bool = False,
 ) -> None:
     """`model_attribute_to_save` is for used to save PPO's policy instead of the full model"""
     # set the generation config to an empty setting to be safe.
@@ -501,6 +608,36 @@ def save_with_accelerate(
     unwrapped_model: transformers.PreTrainedModel = accelerator.unwrap_model(model)
     if model_attribute_to_save is not None:
         unwrapped_model = getattr(unwrapped_model, model_attribute_to_save)
+
+    if (
+        prefer_zero3_offline_merge
+        and not use_lora
+        and model_attribute_to_save is None
+        and accelerator.distributed_type == DistributedType.DEEPSPEED
+        and zero3_checkpoint_dir
+    ):
+        if accelerator.is_main_process:
+            logger.info(
+                "Saving model via offline ZeRO checkpoint merge from %s to %s",
+                zero3_checkpoint_dir,
+                output_dir,
+            )
+            pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+            unwrapped_model.config.save_pretrained(output_dir)
+            generation_config = getattr(unwrapped_model, "generation_config", None)
+            if generation_config is not None:
+                generation_config.save_pretrained(output_dir)
+            save_dtype = _infer_offline_save_dtype(unwrapped_model)
+            logger.info("Offline ZeRO merge target dtype: %s", save_dtype)
+            _save_zero_checkpoint_with_dtype(
+                zero3_checkpoint_dir,
+                output_dir,
+                save_dtype=save_dtype,
+                max_shard_size="5GB",
+            )
+            tokenizer.save_pretrained(output_dir)
+        return
+
     # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
     # Otherwise, sometimes the model will be saved with only part of the parameters.
     # Also, accelerator needs to use the wrapped model to get the state_dict.
