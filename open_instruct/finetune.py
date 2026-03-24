@@ -60,6 +60,7 @@ from open_instruct.dataset_transformation import (
 from open_instruct.llopa_adapter import (
     LLOPADataCollator,
     PREFILL_LOWER_SYSTEM_LEN_KEY,
+    compute_prefill_lower_freeze_batch_loss,
     compute_llopa_batch_loss,
     compute_llopa_batch_loss_streaming_backward,
     get_prefill_lower_system_len,
@@ -536,6 +537,28 @@ class FlatArguments:
         default=0,
         metadata={"help": "For full-sequence training, preserve attention in the first K layers and skip attention above them."},
     )
+    solo_attention_layers: int = field(
+        default=0,
+        metadata={"help": "For full-sequence training, preserve standard attention in the first K layers and use self-only attention above them."},
+    )
+    prefill_lower_freeze: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Freeze baseline: lower K layers are computed normally, then system/user prefix hidden states are "
+                "frozen at layer K while BOS and assistant continue through upper layers."
+            )
+        },
+    )
+    prefill_lower_solo_attention: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Solo-attention baseline: lower K layers are computed normally, then system/user prefix tokens use "
+                "self-only attention in upper layers while BOS and assistant keep normal upper attention."
+            )
+        },
+    )
     llopa_loss_scope: str = field(
         default="last_turn", metadata={"help": "LLoPA assistant loss scope: last_turn | all_assistant."}
     )
@@ -697,6 +720,34 @@ class FlatArguments:
         self.system_prefill = normalize_system_prefill(self.system_prefill)
         if self.prefill_lower_layers > 0 and self.packing:
             raise ValueError("prefill_lower_layers path does not support packing.")
+        if self.prefill_lower_freeze:
+            if self.prefill_lower_layers <= 0:
+                raise ValueError("prefill_lower_freeze requires prefill_lower_layers > 0.")
+            if self.unified_llopa:
+                raise ValueError("prefill_lower_freeze cannot be combined with --unified_llopa.")
+            if self.llopa:
+                raise ValueError("prefill_lower_freeze cannot be combined with --llopa.")
+            if self.no_upper_layers:
+                raise ValueError("prefill_lower_freeze cannot be combined with --no_upper_layers.")
+            if self.skip_upper_attention_layers > 0 or self.solo_attention_layers > 0:
+                raise ValueError("prefill_lower_freeze cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
+            if self.load_balancing_loss:
+                raise ValueError("prefill_lower_freeze does not support load_balancing_loss.")
+        if self.prefill_lower_solo_attention:
+            if self.prefill_lower_layers <= 0:
+                raise ValueError("prefill_lower_solo_attention requires prefill_lower_layers > 0.")
+            if self.unified_llopa:
+                raise ValueError("prefill_lower_solo_attention cannot be combined with --unified_llopa.")
+            if self.llopa:
+                raise ValueError("prefill_lower_solo_attention cannot be combined with --llopa.")
+            if self.no_upper_layers:
+                raise ValueError("prefill_lower_solo_attention cannot be combined with --no_upper_layers.")
+            if self.prefill_lower_freeze:
+                raise ValueError("prefill_lower_solo_attention cannot be combined with --prefill_lower_freeze.")
+            if self.skip_upper_attention_layers > 0 or self.solo_attention_layers > 0:
+                raise ValueError("prefill_lower_solo_attention cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
+            if self.load_balancing_loss:
+                raise ValueError("prefill_lower_solo_attention does not support load_balancing_loss.")
         if self.unified_llopa:
             if self.lower_layers <= 0:
                 raise ValueError("unified_llopa requires lower_layers > 0.")
@@ -714,8 +765,8 @@ class FlatArguments:
                 raise ValueError("unified_llopa cannot be combined with legacy --llopa.")
             if self.prefill_lower_layers > 0:
                 raise ValueError("unified_llopa cannot be combined with legacy --prefill_lower_layers.")
-            if self.skip_upper_attention_layers > 0:
-                raise ValueError("unified_llopa cannot be combined with --skip_upper_attention_layers.")
+            if self.skip_upper_attention_layers > 0 or self.solo_attention_layers > 0:
+                raise ValueError("unified_llopa cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
             if self.no_upper_layers:
                 raise ValueError("unified_llopa cannot be combined with --no_upper_layers.")
         if self.no_upper_layers:
@@ -723,8 +774,8 @@ class FlatArguments:
                 raise ValueError("no_upper_layers requires prefill_lower_layers > 0.")
             if self.llopa:
                 raise ValueError("no_upper_layers cannot be combined with --llopa.")
-            if self.skip_upper_attention_layers > 0:
-                raise ValueError("no_upper_layers cannot be combined with --skip_upper_attention_layers.")
+            if self.skip_upper_attention_layers > 0 or self.solo_attention_layers > 0:
+                raise ValueError("no_upper_layers cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
             if self.use_lora:
                 raise ValueError("no_upper_layers currently requires full-model training (use_lora=False).")
             if self.train_upper_only > 0:
@@ -742,8 +793,8 @@ class FlatArguments:
                 raise ValueError("LLoPA path does not support load_balancing_loss.")
         if self.llopa and self.prefill_lower_layers > 0:
             raise ValueError("prefill_lower_layers cannot be combined with --llopa.")
-        if self.skip_upper_attention_layers > 0 and self.prefill_lower_layers > 0:
-            raise ValueError("prefill_lower_layers cannot be combined with --skip_upper_attention_layers.")
+        if (self.skip_upper_attention_layers > 0 or self.solo_attention_layers > 0) and self.prefill_lower_layers > 0:
+            raise ValueError("prefill_lower_layers cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
         if self.llopa_modeling_path and self.lopa_modeling_path:
             if self.llopa_modeling_path != self.lopa_modeling_path:
                 raise ValueError(
@@ -923,6 +974,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         or args.llopa
         or args.prefill_lower_layers > 0
         or args.skip_upper_attention_layers > 0
+        or args.solo_attention_layers > 0
         or args.llopa_profile_memory_steps > 0
     )
     if needs_capsule_modeling:
@@ -958,12 +1010,35 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 modeling_path,
                 args.modeling_family,
             )
+        if args.solo_attention_layers > 0:
+            logger.info(
+                "Full-sequence solo-attention enabled | self_only_from_layer=%s | modeling=%s | family=%s",
+                args.solo_attention_layers,
+                modeling_path,
+                args.modeling_family,
+            )
+        if args.prefill_lower_solo_attention:
+            logger.info(
+                "Prefill-lower solo-attention baseline enabled | lower_k=%s | modeling=%s | family=%s",
+                args.prefill_lower_layers,
+                modeling_path,
+                args.modeling_family,
+            )
         if args.prefill_lower_layers > 0:
             logger.warning(
                 "Legacy --prefill_lower_layers path enabled. Prefer --unified_llopa for direct-compatible training."
             )
             logger.info(
                 "Vanilla-compatible prefill-lower path enabled | lower_k=%s | prefill_attn=%s | system_prefill=%s | modeling=%s | family=%s",
+                args.prefill_lower_layers,
+                args.prefill_lower_attn,
+                args.llopa_system_prefill,
+                modeling_path,
+                args.modeling_family,
+            )
+        if args.prefill_lower_freeze:
+            logger.info(
+                "Freeze baseline enabled | lower_k=%s | prefill_attn=%s | system_prefill=%s | modeling=%s | family=%s",
                 args.prefill_lower_layers,
                 args.prefill_lower_attn,
                 args.llopa_system_prefill,
@@ -1497,11 +1572,20 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_lower_layers=int(args.prefill_lower_layers),
                             prefill_lower_attn=str(args.prefill_lower_attn),
                             prefill_lower_system_prefill=str(args.llopa_system_prefill),
+                            prefill_lower_solo_attention=bool(args.prefill_lower_solo_attention),
                             skip_upper_attention_layers=int(args.skip_upper_attention_layers),
+                            solo_attention_layers=int(args.solo_attention_layers),
                         )
                         total_aux_loss += outputs.aux_loss.detach().float()
                         loss = outputs.loss
                         del outputs
+                    elif args.prefill_lower_freeze:
+                        loss = compute_prefill_lower_freeze_batch_loss(
+                            model=model,
+                            batch=batch,
+                            lower_k=int(args.prefill_lower_layers),
+                            prefill_attn=str(args.prefill_lower_attn),
+                        )
                     else:
                         # Standard forward pass
                         outputs = model(
@@ -1510,7 +1594,9 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_lower_layers=int(args.prefill_lower_layers),
                             prefill_lower_attn=str(args.prefill_lower_attn),
                             prefill_lower_system_prefill=str(args.llopa_system_prefill),
+                            prefill_lower_solo_attention=bool(args.prefill_lower_solo_attention),
                             skip_upper_attention_layers=int(args.skip_upper_attention_layers),
+                            solo_attention_layers=int(args.solo_attention_layers),
                         )
                         loss = outputs.loss
                         del outputs

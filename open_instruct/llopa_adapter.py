@@ -99,6 +99,29 @@ def _get_llopa_step_fn(model):
     raise RuntimeError("LLoPA step function not found (missing llopa_step_logits on model).")
 
 
+def _get_prefill_lower_freeze_step_fn(model):
+    candidates = []
+    m = _unwrap_model(model)
+    candidates.append(m)
+    if hasattr(m, "base_model"):
+        candidates.append(getattr(m, "base_model"))
+    if hasattr(m, "get_base_model"):
+        try:
+            candidates.append(m.get_base_model())
+        except Exception:
+            pass
+    if hasattr(m, "model"):
+        candidates.append(getattr(m, "model"))
+
+    for cand in candidates:
+        if cand is not None and hasattr(cand, "tri_vanilla_frozen_prefix_train_forward"):
+            return getattr(cand, "tri_vanilla_frozen_prefix_train_forward")
+    raise RuntimeError(
+        "Prefill-lower freeze step function not found "
+        "(missing tri_vanilla_frozen_prefix_train_forward on model)."
+    )
+
+
 def _zero_proxy_loss(model, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
     """Return a differentiable zero scalar while preserving distributed collectives.
 
@@ -540,6 +563,64 @@ def compute_llopa_batch_loss(
         logger.warning("No valid LLoPA losses in current batch; skipping this batch.")
         return _zero_proxy_loss(model, batch, device)
     return torch.stack(sample_losses).mean()
+
+
+def compute_prefill_lower_freeze_batch_loss(
+    model,
+    batch: dict[str, Any],
+    *,
+    lower_k: int,
+    prefill_attn: str,
+):
+    device = batch["input_ids"].device
+    labels = batch.get("labels")
+    split_starts = batch.get("assistant_header_start")
+    system_lens = batch.get(PREFILL_LOWER_SYSTEM_LEN_KEY)
+    if labels is None:
+        raise RuntimeError("Prefill-lower freeze training requires labels.")
+    if split_starts is None:
+        raise RuntimeError("Prefill-lower freeze training requires assistant_header_start in the batch.")
+    if system_lens is None:
+        raise RuntimeError(f"Prefill-lower freeze training requires {PREFILL_LOWER_SYSTEM_LEN_KEY} in the batch.")
+
+    step_fn = _get_prefill_lower_freeze_step_fn(model)
+    total_loss = None
+    total_weight = None
+
+    for row in range(int(batch["input_ids"].size(0))):
+        input_ids = batch["input_ids"][row : row + 1].to(device=device)
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask[row : row + 1].to(device=device)
+        row_labels = labels[row : row + 1].to(device=device)
+        valid_count = int((row_labels != -100).sum().item())
+        if valid_count <= 0:
+            continue
+
+        out = step_fn(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=row_labels,
+            use_cache=False,
+            logits_to_keep=int(input_ids.size(1)),
+            past_key_values=None,
+            prefill_lower_layers=int(lower_k),
+            prefill_attn=str(prefill_attn),
+            split_start_hint=split_starts[row : row + 1].to(device=device),
+            system_len_hint=system_lens[row : row + 1].to(device=device),
+        )
+        if out is None or out.loss is None:
+            continue
+
+        weight = out.loss.new_tensor(float(valid_count))
+        contrib = out.loss * weight
+        total_loss = contrib if total_loss is None else total_loss + contrib
+        total_weight = weight if total_weight is None else total_weight + weight
+
+    if total_loss is None or total_weight is None or float(total_weight.item()) <= 0.0:
+        logger.warning("No valid prefill-lower freeze losses in current batch; skipping this batch.")
+        return _zero_proxy_loss(model, batch, device)
+    return total_loss / total_weight
 
 
 def compute_llopa_batch_loss_streaming_backward(
