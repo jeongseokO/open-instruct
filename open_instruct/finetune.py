@@ -85,6 +85,47 @@ from open_instruct.utils import (
 logger = get_logger(__name__)
 
 
+FUSION_TOKEN_TEMPLATE = "<|FUSION{}|>"
+
+
+def _build_fusion_token_strings(num_suffix_specials: int) -> list[str]:
+    count = max(0, int(num_suffix_specials or 0))
+    return [FUSION_TOKEN_TEMPLATE.format(i) for i in range(1, count + 1)]
+
+
+def _tokenizer_entry_to_str(token: Any) -> str:
+    content = getattr(token, "content", None)
+    if isinstance(content, str) and content:
+        return content
+    return str(token)
+
+
+def _ensure_suffix_special_tokens(tokenizer, num_suffix_specials: int) -> tuple[list[str], list[int]]:
+    fusion_tokens = _build_fusion_token_strings(num_suffix_specials)
+    if not fusion_tokens:
+        return [], []
+
+    vocab = tokenizer.get_vocab()
+    existing_additional = list(tokenizer.special_tokens_map_extended.get("additional_special_tokens", []) or [])
+    existing_token_strings = {_tokenizer_entry_to_str(token) for token in existing_additional}
+    updated_additional = list(existing_additional)
+    added = False
+    for token in fusion_tokens:
+        if token not in vocab and token not in existing_token_strings:
+            updated_additional.append(token)
+            added = True
+    if added:
+        tokenizer.add_special_tokens({"additional_special_tokens": updated_additional})
+
+    token_ids: list[int] = []
+    for token in fusion_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or int(token_id) < 0:
+            raise ValueError(f"Failed to register suffix fusion token: {token}")
+        token_ids.append(int(token_id))
+    return fusion_tokens, token_ids
+
+
 def _infer_transformer_layers_pattern(model: torch.nn.Module) -> str:
     for candidate in ("layers", "h", "blocks", "block"):
         needle = f".{candidate}."
@@ -205,6 +246,13 @@ def _set_capsule_runtime_metadata(model: torch.nn.Module, args) -> None:
         setattr(config, "capsule_system_prefill", str(args.system_prefill))
         setattr(config, "capsule_user_prefill", str(args.user_prefill))
         setattr(config, "capsule_no_upper_attn", bool(args.no_upper_attn))
+        setattr(config, "capsule_num_suffix_specials", int(getattr(args, "num_suffix_specials", 0) or 0))
+        suffix_tokens = getattr(config, "capsule_suffix_special_tokens", None)
+        suffix_token_ids = getattr(config, "capsule_suffix_special_token_ids", None)
+        if suffix_tokens is not None:
+            setattr(config, "capsule_suffix_special_tokens", list(suffix_tokens))
+        if suffix_token_ids is not None:
+            setattr(config, "capsule_suffix_special_token_ids", list(suffix_token_ids))
 
 
 def _write_capsule_tri_info(output_dir: str, args) -> None:
@@ -217,6 +265,7 @@ def _write_capsule_tri_info(output_dir: str, args) -> None:
         f"system_prefill={str(args.system_prefill)}",
         f"user_prefill={str(args.user_prefill)}",
         f"no_upper_attn={int(bool(args.no_upper_attn))}",
+        f"num_suffix_specials={int(getattr(args, 'num_suffix_specials', 0) or 0)}",
         "capsule_llopa_enabled=1",
     ]
     with open(os.path.join(output_dir, "tri_info.txt"), "w", encoding="utf-8") as f:
@@ -487,6 +536,15 @@ class FlatArguments:
         default=False,
         metadata={"help": "Unified LLoPA decode optimization: skip upper-layer attention."},
     )
+    num_suffix_specials: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of learnable fusion special tokens (<|FUSION1|>...) inserted at the "
+                "prefill/decode boundary for upper layers only."
+            )
+        },
+    )
     llopa: bool = field(
         default=False,
         metadata={"help": "Enable Capsule LLoPA training path (system/user segmented prefill + assistant decode)."},
@@ -691,12 +749,20 @@ class FlatArguments:
             raise ValueError("prefill_lower_attn must be one of {'causal', 'full'}.")
         if self.lower_layers < 0:
             raise ValueError("lower_layers must be >= 0.")
+        if self.num_suffix_specials < 0:
+            raise ValueError("num_suffix_specials must be >= 0.")
+        if self.num_suffix_specials > 0 and self.use_lora:
+            raise ValueError("num_suffix_specials requires full-model training (use_lora=False).")
+        if self.num_suffix_specials > 0 and str(self.modeling_family or "llama").strip().lower() != "llama":
+            raise NotImplementedError("num_suffix_specials currently supports modeling_family='llama' only.")
         if self.prefill_attn not in {"causal", "full"}:
             raise ValueError("prefill_attn must be one of {'causal', 'full'}.")
         self.llopa_system_prefill = normalize_system_prefill(self.llopa_system_prefill)
         self.system_prefill = normalize_system_prefill(self.system_prefill)
         if self.prefill_lower_layers > 0 and self.packing:
             raise ValueError("prefill_lower_layers path does not support packing.")
+        if self.num_suffix_specials > 0 and not (self.unified_llopa or self.prefill_lower_layers > 0):
+            raise ValueError("num_suffix_specials requires unified_llopa or prefill_lower_layers > 0.")
         if self.unified_llopa:
             if self.lower_layers <= 0:
                 raise ValueError("unified_llopa requires lower_layers > 0.")
@@ -810,6 +876,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             tc.chat_template_source_name_or_path,
             tc.chat_template_source_revision or tc.tokenizer_revision,
             tc.tokenizer_name_or_path,
+        )
+    fusion_tokens, fusion_token_ids = _ensure_suffix_special_tokens(tokenizer, int(args.num_suffix_specials))
+    if fusion_tokens:
+        logger.info(
+            "Enabled suffix fusion specials | count=%s | tokens=%s",
+            len(fusion_tokens),
+            ", ".join(fusion_tokens),
         )
 
     # ------------------------------------------------------------
@@ -1048,6 +1121,16 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     else:
         raise ValueError(
             "You are instantiating a new config instance from scratch. This is not supported by this script."
+        )
+
+    setattr(config, "capsule_num_suffix_specials", int(args.num_suffix_specials))
+    setattr(config, "capsule_suffix_special_tokens", list(fusion_tokens))
+    setattr(config, "capsule_suffix_special_token_ids", list(fusion_token_ids))
+    if args.num_suffix_specials > 0 and args.no_upper_attn:
+        logger.warning(
+            "num_suffix_specials=%s is enabled, but no_upper_attn=True disables upper-layer attention, "
+            "so fusion specials will not influence assistant tokens.",
+            args.num_suffix_specials,
         )
 
     if args.model_name_or_path:

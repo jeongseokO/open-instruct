@@ -269,6 +269,92 @@ def test_multiturn_upper_index_builder_respects_system_prefill_modes():
         assert actual_rows == expected_rows
 
 
+def test_repack_upper_with_suffix_specials_inserts_fusion_tokens_before_decode():
+    tri_llama, model = _make_tiny_model()
+    model.config.capsule_num_suffix_specials = 2
+    model.config.capsule_suffix_special_token_ids = [250, 251]
+
+    hidden_size = model.config.hidden_size
+    upper_hidden = torch.zeros((2, 5, hidden_size), dtype=torch.float32)
+    upper_hidden[0, 0, 0] = 1.0
+    upper_hidden[0, 1, 0] = 2.0
+    upper_hidden[0, 2, 0] = 3.0
+    upper_hidden[1, 0, 0] = 4.0
+    upper_hidden[1, 1, 0] = 5.0
+    upper_hidden[1, 2, 0] = 6.0
+    upper_hidden[1, 3, 0] = 7.0
+    upper_hidden[1, 4, 0] = 8.0
+
+    upper_position_ids = torch.tensor(
+        [
+            [0, 10, 11, 0, 0],
+            [0, 1, 12, 13, 14],
+        ],
+        dtype=torch.long,
+    )
+    upper_attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1],
+        ],
+        dtype=torch.long,
+    )
+    decode_labels = torch.tensor(
+        [
+            [-100, 100, 101, -100, -100],
+            [-100, -100, 200, 201, 202],
+        ],
+        dtype=torch.long,
+    )
+    prefix_keep_lens = torch.tensor([1, 2], dtype=torch.long)
+    split_starts = torch.tensor([10, 12], dtype=torch.long)
+
+    repacked_hidden, repacked_position_ids, repacked_attention_mask, repacked_labels, repacked_valid_lens = (
+        tri_llama._tri_repack_upper_with_suffix_specials(
+            model,
+            upper_hidden=upper_hidden,
+            upper_position_ids=upper_position_ids,
+            upper_attention_mask=upper_attention_mask,
+            decode_labels=decode_labels,
+            prefix_keep_lens=prefix_keep_lens,
+            split_starts=split_starts,
+        )
+    )
+
+    expected_specials = model.model.embed_tokens(torch.tensor([[250, 251]], dtype=torch.long)).squeeze(0)
+
+    assert repacked_hidden.shape == (2, 7, hidden_size)
+    assert repacked_valid_lens.tolist() == [5, 7]
+    assert repacked_attention_mask[0].tolist() == [1, 1, 1, 1, 1, 0, 0]
+    assert repacked_attention_mask[1].tolist() == [1, 1, 1, 1, 1, 1, 1]
+    assert repacked_position_ids[0].tolist() == [0, 8, 9, 10, 11, 0, 0]
+    assert repacked_position_ids[1].tolist() == [0, 1, 10, 11, 12, 13, 14]
+    assert repacked_labels[0].tolist() == [-100, -100, -100, 100, 101, -100, -100]
+    assert repacked_labels[1].tolist() == [-100, -100, -100, -100, 200, 201, 202]
+    torch.testing.assert_close(repacked_hidden[0, 1:3], expected_specials)
+    torch.testing.assert_close(repacked_hidden[1, 2:4], expected_specials)
+
+
+def test_prefill_decode_with_suffix_specials_extends_only_upper_cache():
+    tri_llama, model = _make_tiny_model()
+    model.config.capsule_num_suffix_specials = 2
+    model.config.capsule_suffix_special_token_ids = [250, 251]
+    batch = _make_single_turn_batch()
+
+    with torch.no_grad():
+        outputs = model(
+            **batch,
+            use_cache=True,
+            prefill_lower_layers=1,
+            prefill_lower_attn="causal",
+            prefill_lower_system_prefill="full",
+        )
+
+    assert outputs.past_key_values is not None
+    assert tri_llama._layer_past_len(outputs.past_key_values, 0) == 8
+    assert tri_llama._layer_past_len(outputs.past_key_values, 1) == 7
+
+
 def test_single_turn_metadata_does_not_change_prefill_lower_loss():
     _, model = _make_tiny_model()
     batch = _make_single_turn_batch()
