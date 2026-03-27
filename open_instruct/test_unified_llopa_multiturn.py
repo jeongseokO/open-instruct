@@ -352,7 +352,168 @@ def test_prefill_decode_with_suffix_specials_extends_only_upper_cache():
 
     assert outputs.past_key_values is not None
     assert tri_llama._layer_past_len(outputs.past_key_values, 0) == 8
-    assert tri_llama._layer_past_len(outputs.past_key_values, 1) == 7
+    assert tri_llama._layer_past_len(outputs.past_key_values, 1) == 8
+
+
+def test_insert_suffix_specials_inband_single_turn_updates_labels_and_split_start():
+    tri_llama, _ = _make_tiny_model()
+    batch = _make_single_turn_batch()
+
+    (
+        new_input_ids,
+        new_attention_mask,
+        new_labels,
+        new_split_starts,
+        new_header_starts,
+        new_header_mask,
+    ) = tri_llama._tri_insert_suffix_specials_inband(
+        token_ids=[250, 251],
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        labels=batch["labels"],
+        split_starts=batch["assistant_header_start"],
+        assistant_header_starts=batch[dt.ASSISTANT_HEADER_STARTS_KEY],
+        assistant_header_start_mask=batch[dt.ASSISTANT_HEADER_START_MASK_KEY],
+    )
+
+    assert new_input_ids.tolist() == [[10, 11, 20, 21, 250, 251, 30, 31, 40, 41]]
+    assert new_attention_mask.tolist() == [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]
+    assert new_labels.tolist() == [[-100, -100, -100, -100, -100, -100, -100, -100, 40, 41]]
+    assert new_split_starts.tolist() == [4]
+    assert new_header_starts.tolist() == [[4]]
+    assert new_header_mask.tolist() == [[True]]
+
+
+def test_insert_suffix_specials_inband_multiturn_remaps_turn_starts():
+    tri_llama, _ = _make_tiny_model()
+    batch = _make_multi_turn_batch()
+
+    (
+        new_input_ids,
+        new_attention_mask,
+        new_labels,
+        new_split_starts,
+        new_header_starts,
+        new_header_mask,
+    ) = tri_llama._tri_insert_suffix_specials_inband(
+        token_ids=[250, 251],
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        labels=batch["labels"],
+        split_starts=batch["assistant_header_start"],
+        assistant_header_starts=batch[dt.ASSISTANT_HEADER_STARTS_KEY],
+        assistant_header_start_mask=batch[dt.ASSISTANT_HEADER_START_MASK_KEY],
+    )
+
+    assert new_input_ids.tolist() == [[10, 11, 20, 21, 250, 251, 30, 31, 40, 41, 50, 51, 250, 251, 60, 61, 70, 71]]
+    assert new_attention_mask.tolist() == [[1] * 18]
+    assert new_labels.tolist() == [[-100, -100, -100, -100, -100, -100, -100, -100, 40, 41, -100, -100, -100, -100, -100, -100, 70, 71]]
+    assert new_split_starts.tolist() == [12]
+    assert new_header_starts.tolist() == [[4, 12]]
+    assert new_header_mask.tolist() == [[True, True]]
+
+
+def test_unified_inband_single_turn_matches_manual_mutated_upper_path():
+    tri_llama, model = _make_tiny_model()
+    model.config.capsule_num_suffix_specials = 2
+    model.config.capsule_suffix_special_token_ids = [250, 251]
+    model.config.capsule_fusion_mode = "inband"
+    batch = _make_single_turn_batch()
+
+    with torch.no_grad():
+        one_shot = model(
+            **batch,
+            use_cache=False,
+            prefill_lower_layers=1,
+            prefill_lower_attn="causal",
+            prefill_lower_system_prefill="full",
+        )
+        (
+            mutated_input_ids,
+            mutated_attention_mask,
+            mutated_labels,
+            _,
+            _,
+            _,
+        ) = tri_llama._tri_insert_suffix_specials_inband(
+            token_ids=[250, 251],
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+            split_starts=batch["assistant_header_start"],
+            assistant_header_starts=batch[dt.ASSISTANT_HEADER_STARTS_KEY],
+            assistant_header_start_mask=batch[dt.ASSISTANT_HEADER_START_MASK_KEY],
+        )
+        mutated_batch = {
+            "input_ids": mutated_input_ids,
+            "attention_mask": mutated_attention_mask,
+            "labels": mutated_labels,
+            PREFILL_LOWER_SYSTEM_LEN_KEY: batch[PREFILL_LOWER_SYSTEM_LEN_KEY],
+        }
+        hidden_states, position_ids = _run_lower_stack(tri_llama, model, mutated_batch, lower_k=1)
+        valid_lens = mutated_attention_mask.sum(dim=1, dtype=torch.long)
+        split_starts = torch.tensor([4], dtype=torch.long)
+        system_lens = mutated_batch[PREFILL_LOWER_SYSTEM_LEN_KEY]
+        upper_gather_idx, upper_valid_mask, _ = tri_llama._tri_build_prefill_lower_upper_index_batch(
+            split_starts=split_starts,
+            valid_lens=valid_lens,
+            system_lens=system_lens,
+            system_prefill="full",
+            device=hidden_states.device,
+        )
+        upper_hidden, _ = tri_llama._tri_pack_indexed_tensor(
+            hidden_states,
+            gather_idx=upper_gather_idx,
+            valid_mask=upper_valid_mask,
+            pad_value=0.0,
+        )
+        upper_position_ids, _ = tri_llama._tri_pack_indexed_tensor(
+            position_ids,
+            gather_idx=upper_gather_idx,
+            valid_mask=upper_valid_mask,
+            pad_value=0,
+        )
+        decode_labels, _ = tri_llama._tri_pack_indexed_tensor(
+            mutated_labels,
+            gather_idx=upper_gather_idx,
+            valid_mask=upper_valid_mask,
+            pad_value=-100,
+        )
+        upper_attention_mask = upper_valid_mask.to(dtype=mutated_attention_mask.dtype)
+        batched_hidden = _run_upper_stack(
+            tri_llama,
+            model,
+            upper_hidden,
+            upper_position_ids,
+            upper_attention_mask,
+            lower_k=1,
+        )
+        batched_logits = model.lm_head(batched_hidden)
+        batched_loss = model.loss_function(logits=batched_logits, labels=decode_labels, vocab_size=model.config.vocab_size)
+
+    torch.testing.assert_close(one_shot.loss, batched_loss)
+
+
+def test_prefill_decode_with_inband_fusion_uses_mutated_sequence_without_upper_only_cache_write():
+    tri_llama, model = _make_tiny_model()
+    model.config.capsule_num_suffix_specials = 2
+    model.config.capsule_suffix_special_token_ids = [250, 251]
+    model.config.capsule_fusion_mode = "inband"
+    batch = _make_single_turn_batch()
+
+    with torch.no_grad():
+        outputs = model(
+            **batch,
+            use_cache=True,
+            prefill_lower_layers=1,
+            prefill_lower_attn="causal",
+            prefill_lower_system_prefill="full",
+        )
+
+    assert outputs.past_key_values is not None
+    assert not bool(getattr(outputs.past_key_values, "_capsule_suffix_specials_written", False))
+    assert tri_llama._layer_past_len(outputs.past_key_values, 0) == 10
+    assert tri_llama._layer_past_len(outputs.past_key_values, 1) == 8
 
 
 def test_single_turn_metadata_does_not_change_prefill_lower_loss():

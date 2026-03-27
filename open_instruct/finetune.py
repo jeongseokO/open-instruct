@@ -128,6 +128,68 @@ def _ensure_suffix_special_tokens(tokenizer, num_suffix_specials: int) -> tuple[
     return fusion_tokens, token_ids
 
 
+def _feature_value_to_int_list(value: Any) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        return [int(v) for v in value.view(-1).tolist()]
+    return [int(v) for v in list(value)]
+
+
+def _extract_assistant_turn_starts(feature_dict: dict[str, Any]) -> list[int]:
+    turn_starts_raw = feature_dict.pop(ASSISTANT_HEADER_STARTS_KEY, None)
+    split_start_raw = feature_dict.pop(ASSISTANT_HEADER_START_KEY, None)
+
+    turn_starts: list[int] = []
+    if turn_starts_raw is not None:
+        for raw_start in _feature_value_to_int_list(turn_starts_raw):
+            if raw_start >= 0:
+                turn_starts.append(int(raw_start))
+    if not turn_starts and split_start_raw is not None:
+        if isinstance(split_start_raw, torch.Tensor):
+            split_start = int(split_start_raw.item())
+        else:
+            split_start = int(split_start_raw)
+        if split_start >= 0:
+            turn_starts.append(split_start)
+    return turn_starts
+
+
+def _insert_vanilla_suffix_specials_into_feature(
+    feature: dict[str, Any],
+    *,
+    suffix_token_ids: list[int],
+) -> dict[str, Any]:
+    feature_dict = dict(feature)
+    turn_starts = _extract_assistant_turn_starts(feature_dict)
+    if not turn_starts:
+        raise ValueError("assistant_header_start(s) must be present for vanilla suffix-special batches.")
+
+    input_ids = _feature_value_to_int_list(feature_dict["input_ids"])
+    labels = _feature_value_to_int_list(feature_dict["labels"])
+    attention_mask_raw = feature_dict.get("attention_mask")
+    if attention_mask_raw is None:
+        attention_mask = [1] * len(input_ids)
+    else:
+        attention_mask = _feature_value_to_int_list(attention_mask_raw)
+
+    if not (len(input_ids) == len(labels) == len(attention_mask)):
+        raise ValueError("input_ids, labels, and attention_mask must have the same length.")
+
+    label_pad = [-100] * len(suffix_token_ids)
+    mask_pad = [1] * len(suffix_token_ids)
+    offset = 0
+    for raw_start in turn_starts:
+        insert_at = min(max(int(raw_start) + offset, 0), len(input_ids))
+        input_ids[insert_at:insert_at] = suffix_token_ids
+        labels[insert_at:insert_at] = label_pad
+        attention_mask[insert_at:insert_at] = mask_pad
+        offset += len(suffix_token_ids)
+
+    feature_dict["input_ids"] = input_ids
+    feature_dict["labels"] = labels
+    feature_dict["attention_mask"] = attention_mask
+    return feature_dict
+
+
 def _infer_transformer_layers_pattern(model: torch.nn.Module) -> str:
     for candidate in ("layers", "h", "blocks", "block"):
         needle = f".{candidate}."
@@ -249,6 +311,7 @@ def _set_capsule_runtime_metadata(model: torch.nn.Module, args) -> None:
         setattr(config, "capsule_user_prefill", str(args.user_prefill))
         setattr(config, "capsule_no_upper_attn", bool(args.no_upper_attn))
         setattr(config, "capsule_num_suffix_specials", int(getattr(args, "num_suffix_specials", 0) or 0))
+        setattr(config, "capsule_fusion_mode", _normalize_fusion_mode(getattr(args, "fusion_mode", "upper_only")))
         suffix_tokens = getattr(config, "capsule_suffix_special_tokens", None)
         suffix_token_ids = getattr(config, "capsule_suffix_special_token_ids", None)
         if suffix_tokens is not None:
@@ -268,6 +331,7 @@ def _write_capsule_tri_info(output_dir: str, args) -> None:
         f"user_prefill={str(args.user_prefill)}",
         f"no_upper_attn={int(bool(args.no_upper_attn))}",
         f"num_suffix_specials={int(getattr(args, 'num_suffix_specials', 0) or 0)}",
+        f"fusion_mode={_normalize_fusion_mode(getattr(args, 'fusion_mode', 'upper_only'))}",
         "capsule_llopa_enabled=1",
     ]
     with open(os.path.join(output_dir, "tri_info.txt"), "w", encoding="utf-8") as f:
@@ -281,6 +345,35 @@ def _maybe_suffix_exp_name_for_system_prefill(args) -> None:
     args.system_prefill = normalized_system_prefill
     if normalized_system_prefill == "no_system" and not str(args.exp_name).endswith("-no_system"):
         args.exp_name = f"{args.exp_name}-no_system"
+
+
+def _use_vanilla_suffix_specials(args) -> bool:
+    return bool(
+        int(getattr(args, "num_suffix_specials", 0) or 0) > 0
+        and not bool(getattr(args, "unified_llopa", False))
+        and not bool(getattr(args, "llopa", False))
+        and int(getattr(args, "prefill_lower_layers", 0) or 0) <= 0
+    )
+
+
+def _normalize_fusion_mode(mode: Any) -> str:
+    normalized = str(mode or "upper_only").strip().lower()
+    return normalized or "upper_only"
+
+
+class VanillaSuffixSpecialDataCollator:
+    def __init__(self, *, tokenizer, model, suffix_token_ids: list[int]):
+        if not suffix_token_ids:
+            raise ValueError("VanillaSuffixSpecialDataCollator requires at least one suffix token id.")
+        self.base_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
+        self.suffix_token_ids = [int(token_id) for token_id in suffix_token_ids]
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        stripped_features = [
+            _insert_vanilla_suffix_specials_into_feature(feature, suffix_token_ids=self.suffix_token_ids)
+            for feature in features
+        ]
+        return self.base_collator(stripped_features)
 
 
 class PrefillLowerDataCollator:
@@ -559,7 +652,18 @@ class FlatArguments:
         metadata={
             "help": (
                 "Number of learnable fusion special tokens (<|FUSION1|>...) inserted at the "
-                "prefill/decode boundary for upper layers only."
+                "assistant boundary. Unified LLoPA/prefill-lower insert them in the upper path; "
+                "plain vanilla inserts them directly into the token sequence before assistant turns."
+            )
+        },
+    )
+    fusion_mode: str = field(
+        default="upper_only",
+        metadata={
+            "help": (
+                "Suffix-fusion behavior for unified LLoPA. "
+                "'upper_only' inserts fusion specials only in the upper path; "
+                "'inband' inserts them into the token stream before lower-layer processing."
             )
         },
     )
@@ -795,14 +899,17 @@ class FlatArguments:
             raise ValueError("num_suffix_specials requires full-model training (use_lora=False).")
         if self.num_suffix_specials > 0 and str(self.modeling_family or "llama").strip().lower() != "llama":
             raise NotImplementedError("num_suffix_specials currently supports modeling_family='llama' only.")
+        self.fusion_mode = _normalize_fusion_mode(self.fusion_mode)
+        if self.fusion_mode not in {"upper_only", "inband"}:
+            raise ValueError("fusion_mode must be one of {'upper_only', 'inband'}.")
         if self.prefill_attn not in {"causal", "full"}:
             raise ValueError("prefill_attn must be one of {'causal', 'full'}.")
         self.llopa_system_prefill = normalize_system_prefill(self.llopa_system_prefill)
         self.system_prefill = normalize_system_prefill(self.system_prefill)
+        if self.num_suffix_specials > 0 and self.packing:
+            raise ValueError("num_suffix_specials does not support packing.")
         if self.prefill_lower_layers > 0 and self.packing:
             raise ValueError("prefill_lower_layers path does not support packing.")
-        if self.num_suffix_specials > 0 and not (self.unified_llopa or self.prefill_lower_layers > 0):
-            raise ValueError("num_suffix_specials requires unified_llopa or prefill_lower_layers > 0.")
         if self.prefill_lower_freeze:
             if self.prefill_lower_layers <= 0:
                 raise ValueError("prefill_lower_freeze requires prefill_lower_layers > 0.")
@@ -852,6 +959,8 @@ class FlatArguments:
                 raise ValueError("unified_llopa cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
             if self.no_upper_layers:
                 raise ValueError("unified_llopa cannot be combined with --no_upper_layers.")
+        elif self.fusion_mode == "inband":
+            raise ValueError("fusion_mode='inband' is supported with --unified_llopa only.")
         if self.no_upper_layers:
             if self.prefill_lower_layers <= 0:
                 raise ValueError("no_upper_layers requires prefill_lower_layers > 0.")
@@ -1040,6 +1149,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     # This also enforces identical sample filtering between LLoPA and vanilla runs.
     needs_messages_for_sft_filter = "sft_tulu_filter_v1" in args.dataset_transform_fn
     prefill_lower_needs_messages = bool(args.prefill_lower_layers > 0 or args.unified_llopa)
+    vanilla_suffix_specials_enabled = _use_vanilla_suffix_specials(args)
     if needs_messages_for_sft_filter or args.use_single_only or args.llopa or prefill_lower_needs_messages:
         if tc.sft_messages_key not in args.dataset_target_columns:
             args.dataset_target_columns = [*args.dataset_target_columns, tc.sft_messages_key]
@@ -1059,6 +1169,11 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         and ASSISTANT_HEADER_STARTS_KEY not in args.dataset_target_columns
     ):
         args.dataset_target_columns = [*args.dataset_target_columns, ASSISTANT_HEADER_STARTS_KEY]
+    if vanilla_suffix_specials_enabled and prefill_lower_boundary_ready:
+        if ASSISTANT_HEADER_START_KEY not in args.dataset_target_columns:
+            args.dataset_target_columns = [*args.dataset_target_columns, ASSISTANT_HEADER_START_KEY]
+        if ASSISTANT_HEADER_STARTS_KEY not in args.dataset_target_columns:
+            args.dataset_target_columns = [*args.dataset_target_columns, ASSISTANT_HEADER_STARTS_KEY]
     needs_capsule_modeling = bool(
         args.unified_llopa
         or args.llopa
@@ -1081,12 +1196,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         install_llopa_modeling(modeling_path=modeling_path, model_family=args.modeling_family)
         if args.unified_llopa:
             logger.info(
-                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | modeling=%s | family=%s",
+                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | fusion_mode=%s | num_suffix_specials=%s | modeling=%s | family=%s",
                 args.lower_layers,
                 args.prefill_mode,
                 args.prefill_attn,
                 args.system_prefill,
                 args.no_upper_attn,
+                _normalize_fusion_mode(args.fusion_mode),
+                args.num_suffix_specials,
                 modeling_path,
                 args.modeling_family,
             )
@@ -1135,6 +1252,11 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 modeling_path,
                 args.modeling_family,
             )
+    elif vanilla_suffix_specials_enabled:
+        logger.info(
+            "Plain vanilla suffix-special path enabled | count=%s | assistant-boundary insertion in collator",
+            args.num_suffix_specials,
+        )
 
     with accelerator.main_process_first():
         transform_fn_args = []
@@ -1177,6 +1299,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             dataset_local_cache_dir=args.dataset_local_cache_dir,
             dataset_skip_cache=args.dataset_skip_cache,
         )
+        if vanilla_suffix_specials_enabled and (
+            ASSISTANT_HEADER_STARTS_KEY not in train_dataset.column_names
+            and ASSISTANT_HEADER_START_KEY not in train_dataset.column_names
+        ):
+            raise ValueError(
+                "Plain vanilla num_suffix_specials requires assistant header boundary metadata in the dataset. "
+                "Use a tokenization transform that emits assistant_header_start(s)."
+            )
         train_dataset = train_dataset.shuffle(seed=args.seed)
         if args.use_single_only and not args.llopa and not prefill_lower_needs_messages and tc.sft_messages_key in train_dataset.column_names:
             train_dataset = train_dataset.remove_columns([tc.sft_messages_key])
@@ -1218,7 +1348,12 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     setattr(config, "capsule_num_suffix_specials", int(args.num_suffix_specials))
     setattr(config, "capsule_suffix_special_tokens", list(fusion_tokens))
     setattr(config, "capsule_suffix_special_token_ids", list(fusion_token_ids))
-    if args.num_suffix_specials > 0 and args.no_upper_attn:
+    setattr(config, "capsule_fusion_mode", _normalize_fusion_mode(args.fusion_mode))
+    if (
+        args.num_suffix_specials > 0
+        and args.no_upper_attn
+        and _normalize_fusion_mode(args.fusion_mode) == "upper_only"
+    ):
         logger.warning(
             "num_suffix_specials=%s is enabled, but no_upper_attn=True disables upper-layer attention, "
             "so fusion specials will not influence assistant tokens.",
@@ -1368,6 +1503,12 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             messages_key=tc.sft_messages_key,
             system_prefill=str(args.llopa_system_prefill),
             enable_batched_last_turn=bool(args.prefill_lower_solo_attention or args.prefill_lower_freeze),
+        )
+    elif _use_vanilla_suffix_specials(args):
+        collate_fn = VanillaSuffixSpecialDataCollator(
+            tokenizer=tokenizer,
+            model=model,
+            suffix_token_ids=fusion_token_ids,
         )
     else:
         collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")

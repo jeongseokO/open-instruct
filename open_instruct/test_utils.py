@@ -511,6 +511,26 @@ class TestFlatArguments(unittest.TestCase):
         self.assertIsInstance(args.additional_model_arguments, dict)
         self.assertFalse(args.additional_model_arguments)
 
+    def test_fusion_mode_defaults_to_upper_only(self) -> None:
+        args = FlatArguments(exp_name="test")
+        self.assertEqual(args.fusion_mode, "upper_only")
+
+    def test_inband_fusion_requires_unified_llopa(self) -> None:
+        with self.assertRaisesRegex(ValueError, "fusion_mode='inband' is supported with --unified_llopa only."):
+            FlatArguments(exp_name="test", fusion_mode="inband")
+
+    def test_inband_fusion_allowed_for_unified_llopa(self) -> None:
+        args = FlatArguments(
+            exp_name="test",
+            fusion_mode="inband",
+            unified_llopa=True,
+            lower_layers=1,
+            prefill_mode="lower",
+            user_prefill="full",
+            llopa_loss_scope="last_turn",
+        )
+        self.assertEqual(args.fusion_mode, "inband")
+
 
 class TestModelDims(unittest.TestCase):
     def test_qwen25_7b_flops_calculation(self):
