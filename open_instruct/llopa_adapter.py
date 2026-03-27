@@ -20,6 +20,13 @@ LLOPA_USER_MASK_KEY = "llopa_user_attention_mask"
 LLOPA_ASSISTANT_IDS_KEY = "llopa_assistant_ids"
 LLOPA_ASSISTANT_MASK_KEY = "llopa_assistant_attention_mask"
 LLOPA_LABELS_KEY = "llopa_labels"
+PREFILL_SYSTEM_IDS_KEY = "prefill_system_ids"
+PREFILL_SYSTEM_MASK_KEY = "prefill_system_attention_mask"
+PREFILL_USER_IDS_KEY = "prefill_user_ids"
+PREFILL_USER_MASK_KEY = "prefill_user_attention_mask"
+PREFILL_ASSISTANT_IDS_KEY = "prefill_assistant_ids"
+PREFILL_ASSISTANT_MASK_KEY = "prefill_assistant_attention_mask"
+PREFILL_LABELS_KEY = "prefill_labels"
 PREFILL_LOWER_SYSTEM_LEN_KEY = "prefill_lower_system_len"
 _WARNED_BATCHED_LAST_TURN_FALLBACK = False
 
@@ -99,7 +106,7 @@ def _get_llopa_step_fn(model):
     raise RuntimeError("LLoPA step function not found (missing llopa_step_logits on model).")
 
 
-def _get_prefill_lower_freeze_step_fn(model):
+def _get_prefill_lower_freeze_segmented_step_fn(model):
     candidates = []
     m = _unwrap_model(model)
     candidates.append(m)
@@ -114,12 +121,9 @@ def _get_prefill_lower_freeze_step_fn(model):
         candidates.append(getattr(m, "model"))
 
     for cand in candidates:
-        if cand is not None and hasattr(cand, "tri_vanilla_frozen_prefix_train_forward"):
-            return getattr(cand, "tri_vanilla_frozen_prefix_train_forward")
-    raise RuntimeError(
-        "Prefill-lower freeze step function not found "
-        "(missing tri_vanilla_frozen_prefix_train_forward on model)."
-    )
+        if cand is not None and hasattr(cand, "segmented_prefill_lower_freeze_step_logits"):
+            return getattr(cand, "segmented_prefill_lower_freeze_step_logits")
+    return None
 
 
 def _zero_proxy_loss(model, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
@@ -409,6 +413,67 @@ def _batch_llopa_last_turn_examples(tokenizer, messages_batch: list[Any], *, sys
     }
 
 
+def _build_prefill_last_turn_example(tokenizer, sample_messages: Any):
+    device = torch.device("cpu")
+    msgs = normalize_prompt_messages(sample_messages)
+    assistant_turns = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
+    if not assistant_turns:
+        return None
+
+    turn_idx = assistant_turns[-1]
+    assistant_text = str(msgs[turn_idx].get("content") or "").strip()
+    if not assistant_text:
+        return None
+
+    prefix_msgs = msgs[:turn_idx]
+    _, system_ids, user_ids, su_gen, assistant_header_delta = _build_segments(tokenizer, prefix_msgs, device)
+    assistant_delta = _assistant_content_delta(tokenizer, prefix_msgs, assistant_text, su_gen, device)
+    if assistant_delta.size(1) < 1:
+        return None
+
+    assistant_ids = torch.cat([assistant_header_delta, assistant_delta], dim=1)
+    if assistant_ids.size(1) < 2:
+        return None
+
+    labels = assistant_ids.clone()
+    if assistant_header_delta.size(1) > 0:
+        labels[:, : assistant_header_delta.size(1)] = -100
+
+    return {
+        PREFILL_SYSTEM_IDS_KEY: system_ids,
+        PREFILL_USER_IDS_KEY: user_ids,
+        PREFILL_ASSISTANT_IDS_KEY: assistant_ids,
+        PREFILL_LABELS_KEY: labels,
+    }
+
+
+def _batch_prefill_last_turn_examples(tokenizer, messages_batch: list[Any]):
+    examples = []
+    for sample_messages in messages_batch:
+        example = _build_prefill_last_turn_example(tokenizer, sample_messages)
+        if example is None:
+            return None
+        examples.append(example)
+
+    pad_token_id = getattr(tokenizer, "pad_token_id", 0)
+    if pad_token_id is None:
+        pad_token_id = 0
+
+    system_ids, system_mask = _pad_segment_batch([ex[PREFILL_SYSTEM_IDS_KEY] for ex in examples], pad_token_id)
+    user_ids, user_mask = _pad_segment_batch([ex[PREFILL_USER_IDS_KEY] for ex in examples], pad_token_id)
+    assistant_ids, assistant_mask = _pad_segment_batch([ex[PREFILL_ASSISTANT_IDS_KEY] for ex in examples], pad_token_id)
+    labels, _ = _pad_segment_batch([ex[PREFILL_LABELS_KEY] for ex in examples], -100)
+    return {
+        PREFILL_SYSTEM_IDS_KEY: system_ids,
+        PREFILL_SYSTEM_MASK_KEY: system_mask,
+        PREFILL_USER_IDS_KEY: user_ids,
+        PREFILL_USER_MASK_KEY: user_mask,
+        PREFILL_ASSISTANT_IDS_KEY: assistant_ids,
+        PREFILL_ASSISTANT_MASK_KEY: assistant_mask,
+        PREFILL_LABELS_KEY: labels,
+    }
+
+
 class LLOPADataCollator:
     """Token collator + raw message passthrough for LLoPA-specific training."""
 
@@ -449,6 +514,26 @@ class LLOPADataCollator:
                     "Falling back to generic LLoPA last_turn path because batched segment construction failed."
                 )
         return batch
+
+
+def _get_prefill_lower_solo_segmented_step_fn(model):
+    candidates = []
+    m = _unwrap_model(model)
+    candidates.append(m)
+    if hasattr(m, "base_model"):
+        candidates.append(getattr(m, "base_model"))
+    if hasattr(m, "get_base_model"):
+        try:
+            candidates.append(m.get_base_model())
+        except Exception:
+            pass
+    if hasattr(m, "model"):
+        candidates.append(getattr(m, "model"))
+
+    for cand in candidates:
+        if cand is not None and hasattr(cand, "segmented_prefill_lower_solo_step_logits"):
+            return getattr(cand, "segmented_prefill_lower_solo_step_logits")
+    return None
 
 
 def compute_llopa_batch_loss(
@@ -571,56 +656,96 @@ def compute_prefill_lower_freeze_batch_loss(
     *,
     lower_k: int,
     prefill_attn: str,
+    system_prefill: str,
 ):
     device = batch["input_ids"].device
-    labels = batch.get("labels")
-    split_starts = batch.get("assistant_header_start")
-    system_lens = batch.get(PREFILL_LOWER_SYSTEM_LEN_KEY)
-    if labels is None:
-        raise RuntimeError("Prefill-lower freeze training requires labels.")
-    if split_starts is None:
-        raise RuntimeError("Prefill-lower freeze training requires assistant_header_start in the batch.")
-    if system_lens is None:
-        raise RuntimeError(f"Prefill-lower freeze training requires {PREFILL_LOWER_SYSTEM_LEN_KEY} in the batch.")
+    system_ids = batch.get(PREFILL_SYSTEM_IDS_KEY)
+    user_ids = batch.get(PREFILL_USER_IDS_KEY)
+    assistant_ids = batch.get(PREFILL_ASSISTANT_IDS_KEY)
+    prefill_labels = batch.get(PREFILL_LABELS_KEY)
+    system_mask = batch.get(PREFILL_SYSTEM_MASK_KEY)
+    user_mask = batch.get(PREFILL_USER_MASK_KEY)
+    assistant_mask = batch.get(PREFILL_ASSISTANT_MASK_KEY)
+    if (
+        system_ids is None
+        or user_ids is None
+        or assistant_ids is None
+        or prefill_labels is None
+        or system_mask is None
+        or user_mask is None
+        or assistant_mask is None
+    ):
+        raise RuntimeError("Prefill-lower freeze training requires prebatched structured segment tensors.")
 
-    step_fn = _get_prefill_lower_freeze_step_fn(model)
-    total_loss = None
-    total_weight = None
-
-    for row in range(int(batch["input_ids"].size(0))):
-        input_ids = batch["input_ids"][row : row + 1].to(device=device)
-        attention_mask = batch.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask[row : row + 1].to(device=device)
-        row_labels = labels[row : row + 1].to(device=device)
-        valid_count = int((row_labels != -100).sum().item())
-        if valid_count <= 0:
-            continue
-
-        out = step_fn(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=row_labels,
-            use_cache=False,
-            logits_to_keep=int(input_ids.size(1)),
-            past_key_values=None,
-            prefill_lower_layers=int(lower_k),
-            prefill_attn=str(prefill_attn),
-            split_start_hint=split_starts[row : row + 1].to(device=device),
-            system_len_hint=system_lens[row : row + 1].to(device=device),
-        )
-        if out is None or out.loss is None:
-            continue
-
-        weight = out.loss.new_tensor(float(valid_count))
-        contrib = out.loss * weight
-        total_loss = contrib if total_loss is None else total_loss + contrib
-        total_weight = weight if total_weight is None else total_weight + weight
-
-    if total_loss is None or total_weight is None or float(total_weight.item()) <= 0.0:
+    step_fn = _get_prefill_lower_freeze_segmented_step_fn(model)
+    if step_fn is None:
+        raise RuntimeError("Prefill-lower freeze training requires segmented_prefill_lower_freeze_step_logits on the model.")
+    out = step_fn(
+        system_ids=system_ids.to(device=device),
+        system_attention_mask=system_mask.to(device=device),
+        user_ids=user_ids.to(device=device),
+        user_attention_mask=user_mask.to(device=device),
+        assistant_ids=assistant_ids.to(device=device),
+        assistant_attention_mask=assistant_mask.to(device=device),
+        labels=prefill_labels.to(device=device),
+        lower_k=int(lower_k),
+        logits_to_keep=int(assistant_ids.size(1)),
+        prefill_attn=str(prefill_attn),
+        system_prefill=str(system_prefill),
+    )
+    if out is None or out.loss is None:
         logger.warning("No valid prefill-lower freeze losses in current batch; skipping this batch.")
         return _zero_proxy_loss(model, batch, device)
-    return total_loss / total_weight
+    return out.loss
+
+
+def compute_prefill_lower_solo_batch_loss(
+    model,
+    batch: dict[str, Any],
+    *,
+    lower_k: int,
+    prefill_attn: str,
+    system_prefill: str,
+):
+    device = batch["input_ids"].device
+    system_ids = batch.get(PREFILL_SYSTEM_IDS_KEY)
+    user_ids = batch.get(PREFILL_USER_IDS_KEY)
+    assistant_ids = batch.get(PREFILL_ASSISTANT_IDS_KEY)
+    labels = batch.get(PREFILL_LABELS_KEY)
+    system_mask = batch.get(PREFILL_SYSTEM_MASK_KEY)
+    user_mask = batch.get(PREFILL_USER_MASK_KEY)
+    assistant_mask = batch.get(PREFILL_ASSISTANT_MASK_KEY)
+    if (
+        system_ids is None
+        or user_ids is None
+        or assistant_ids is None
+        or labels is None
+        or system_mask is None
+        or user_mask is None
+        or assistant_mask is None
+    ):
+        raise RuntimeError("Prefill-lower solo-attention training requires prebatched structured segment tensors.")
+
+    step_fn = _get_prefill_lower_solo_segmented_step_fn(model)
+    if step_fn is None:
+        raise RuntimeError("Prefill-lower solo-attention training requires segmented_prefill_lower_solo_step_logits on the model.")
+    out = step_fn(
+        system_ids=system_ids.to(device=device),
+        system_attention_mask=system_mask.to(device=device),
+        user_ids=user_ids.to(device=device),
+        user_attention_mask=user_mask.to(device=device),
+        assistant_ids=assistant_ids.to(device=device),
+        assistant_attention_mask=assistant_mask.to(device=device),
+        labels=labels.to(device=device),
+        lower_k=int(lower_k),
+        logits_to_keep=int(assistant_ids.size(1)),
+        prefill_attn=str(prefill_attn),
+        system_prefill=str(system_prefill),
+    )
+    if out is None or out.loss is None:
+        logger.warning("No valid prefill-lower solo-attention losses in current batch; skipping this batch.")
+        return _zero_proxy_loss(model, batch, device)
+    return out.loss
 
 
 def compute_llopa_batch_loss_streaming_backward(
