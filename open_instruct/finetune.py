@@ -61,6 +61,7 @@ from open_instruct.llopa_adapter import (
     LLOPADataCollator,
     PREFILL_LOWER_SYSTEM_LEN_KEY,
     compute_prefill_lower_freeze_batch_loss,
+    compute_prefill_lower_solo_batch_loss,
     compute_llopa_batch_loss,
     compute_llopa_batch_loss_streaming_backward,
     get_prefill_lower_system_len,
@@ -234,11 +235,20 @@ def _maybe_suffix_exp_name_for_system_prefill(args) -> None:
 
 
 class PrefillLowerDataCollator:
-    def __init__(self, *, tokenizer, model, messages_key: str = "messages", system_prefill: str = "no_bos_system"):
+    def __init__(
+        self,
+        *,
+        tokenizer,
+        model,
+        messages_key: str = "messages",
+        system_prefill: str = "no_bos_system",
+        enable_batched_last_turn: bool = False,
+    ):
         self.base_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
         self.tokenizer = tokenizer
         self.messages_key = messages_key
         self.system_prefill = normalize_system_prefill(system_prefill)
+        self.enable_batched_last_turn = bool(enable_batched_last_turn)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         split_starts = []
@@ -283,6 +293,7 @@ class PrefillLowerDataCollator:
             stripped_features.append(feature_dict)
 
         batch = self.base_collator(stripped_features)
+        batch[self.messages_key] = [dict(feature).get(self.messages_key) for feature in features]
         if any(split_start is not None for split_start in split_starts):
             if not all(split_start is not None for split_start in split_starts):
                 raise ValueError("assistant_header_start must be present for every example in a prefill-lower batch.")
@@ -302,6 +313,12 @@ class PrefillLowerDataCollator:
             batch[ASSISTANT_HEADER_STARTS_KEY] = padded_turn_starts
             batch[ASSISTANT_HEADER_START_MASK_KEY] = turn_mask
         batch[PREFILL_LOWER_SYSTEM_LEN_KEY] = torch.tensor(system_lens, dtype=torch.long)
+        if self.enable_batched_last_turn:
+            from open_instruct.llopa_adapter import _batch_prefill_last_turn_examples
+
+            batched_inputs = _batch_prefill_last_turn_examples(self.tokenizer, batch[self.messages_key])
+            if batched_inputs is not None:
+                batch.update(batched_inputs)
         return batch
 
 
@@ -1267,6 +1284,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             model=model,
             messages_key=tc.sft_messages_key,
             system_prefill=str(args.llopa_system_prefill),
+            enable_batched_last_turn=bool(args.prefill_lower_solo_attention or args.prefill_lower_freeze),
         )
     else:
         collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
@@ -1585,6 +1603,15 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             batch=batch,
                             lower_k=int(args.prefill_lower_layers),
                             prefill_attn=str(args.prefill_lower_attn),
+                            system_prefill=str(args.llopa_system_prefill),
+                        )
+                    elif args.prefill_lower_solo_attention:
+                        loss = compute_prefill_lower_solo_batch_loss(
+                            model=model,
+                            batch=batch,
+                            lower_k=int(args.prefill_lower_layers),
+                            prefill_attn=str(args.prefill_lower_attn),
+                            system_prefill=str(args.llopa_system_prefill),
                         )
                     else:
                         # Standard forward pass
