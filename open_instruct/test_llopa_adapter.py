@@ -1,3 +1,5 @@
+import importlib.util
+from pathlib import Path
 import types
 
 import torch
@@ -28,6 +30,17 @@ class DummyTokenizer:
         assert return_tensors == "pt"
         ids = torch.tensor([[ord(ch) + 1 for ch in text]], dtype=torch.long)
         return _DummyEncoding(ids)
+
+
+def _load_structured_prompt_module():
+    repo_root = Path(__file__).resolve().parents[2]
+    module_path = repo_root / "Capsule" / "llopa_utils" / "structured_prompt.py"
+    spec = importlib.util.spec_from_file_location("capsule_structured_prompt", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load structured_prompt module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _sample_messages():
@@ -242,3 +255,48 @@ def test_build_prefill_lower_upper_indices_supports_system_prefill_modes():
     assert torch.equal(full_idx, torch.tensor([0, 1, 2, 3, 7, 8, 9], dtype=torch.long))
     assert torch.equal(no_system_idx, torch.tensor([0, 7, 8, 9], dtype=torch.long))
     assert torch.equal(no_bos_idx, torch.tensor([7, 8, 9], dtype=torch.long))
+
+
+def test_structured_prompt_generation_segments_match_training_segments():
+    tokenizer = DummyTokenizer()
+    structured_prompt = _load_structured_prompt_module()
+    train_example = llopa_adapter._build_prefill_last_turn_example(tokenizer, _sample_messages())
+    structured = structured_prompt.build_structured_prompt_segments(
+        tokenizer,
+        _sample_messages()[:-1],
+        prompt_add_generation_prompt=True,
+        device=torch.device("cpu"),
+    )
+
+    assert train_example is not None
+    assert torch.equal(train_example[llopa_adapter.PREFILL_SYSTEM_IDS_KEY], structured["system_ids"])
+    assert torch.equal(train_example[llopa_adapter.PREFILL_USER_IDS_KEY], structured["user_ids"])
+
+    masked_prefix_len = int((train_example[llopa_adapter.PREFILL_LABELS_KEY] == -100).sum().item())
+    assert masked_prefix_len > 0
+    assert torch.equal(
+        train_example[llopa_adapter.PREFILL_ASSISTANT_IDS_KEY][:, :masked_prefix_len],
+        structured["assistant_prefill_ids"],
+    )
+
+
+def test_structured_prompt_assistant_prefix_segments_match_training_content():
+    tokenizer = DummyTokenizer()
+    structured_prompt = _load_structured_prompt_module()
+    train_example = llopa_adapter._build_prefill_last_turn_example(tokenizer, _sample_messages())
+    structured = structured_prompt.build_structured_prompt_segments(
+        tokenizer,
+        _sample_messages(),
+        prompt_add_generation_prompt=False,
+        device=torch.device("cpu"),
+    )
+
+    assert train_example is not None
+    assert torch.equal(train_example[llopa_adapter.PREFILL_SYSTEM_IDS_KEY], structured["system_ids"])
+    assert torch.equal(train_example[llopa_adapter.PREFILL_USER_IDS_KEY], structured["user_ids"])
+
+    labels = train_example[llopa_adapter.PREFILL_LABELS_KEY]
+    assistant_ids = train_example[llopa_adapter.PREFILL_ASSISTANT_IDS_KEY]
+    assistant_content = assistant_ids[:, labels[0] != -100]
+    assert assistant_content.numel() > 0
+    assert torch.equal(assistant_content, structured["assistant_prefill_ids"])

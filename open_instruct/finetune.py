@@ -24,6 +24,7 @@ with contextlib.suppress(Exception):
 import json
 import math
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -88,6 +89,24 @@ logger = get_logger(__name__)
 
 
 FUSION_TOKEN_TEMPLATE = "<|FUSION{}|>"
+
+
+def _infer_checkpoint_vocab_size_from_load_error(exc: RuntimeError) -> int | None:
+    message = str(exc)
+    if "model.embed_tokens.weight" not in message:
+        return None
+    match = re.search(
+        r"model\.embed_tokens\.weight: copying a param with shape torch\.Size\(\[(\d+),\s*\d+\]\) from checkpoint, "
+        r"the shape in current model is torch\.Size\(\[(\d+),\s*\d+\]\)",
+        message,
+    )
+    if match is None:
+        return None
+    checkpoint_vocab = int(match.group(1))
+    current_vocab = int(match.group(2))
+    if checkpoint_vocab <= current_vocab:
+        return None
+    return checkpoint_vocab
 
 
 def _build_fusion_token_strings(num_suffix_specials: int) -> list[str]:
@@ -1361,6 +1380,23 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         )
 
     if args.model_name_or_path:
+        def _load_model_with_vocab_retry(loader, **loader_kwargs):
+            try:
+                return loader(**loader_kwargs)
+            except RuntimeError as exc:
+                inferred_vocab_size = _infer_checkpoint_vocab_size_from_load_error(exc)
+                if inferred_vocab_size is None:
+                    raise
+                previous_vocab_size = int(getattr(config, "vocab_size", 0) or 0)
+                logger.warning(
+                    "Retrying model load after checkpoint vocab mismatch: config vocab_size=%s, checkpoint vocab_size=%s",
+                    previous_vocab_size,
+                    inferred_vocab_size,
+                )
+                config.vocab_size = inferred_vocab_size
+                loader_kwargs["config"] = config
+                return loader(**loader_kwargs)
+
         if args.use_qlora:
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -1370,8 +1406,9 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             )
             device_index = accelerator.local_process_index
             device_map = {"": device_index}  # force data-parallel training.
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
+            model = _load_model_with_vocab_retry(
+                AutoModelForCausalLM.from_pretrained,
+                pretrained_model_name_or_path=args.model_name_or_path,
                 revision=args.model_revision,
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
@@ -1387,20 +1424,21 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             logger.info("Attempting to apply liger-kernel. fused_linear_cross_entropy=True")
 
             # Supported models: https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/transformers/monkey_patch.py#L948
-            model = AutoLigerKernelForCausalLM.from_pretrained(
-                args.model_name_or_path,
+            model = _load_model_with_vocab_retry(
+                AutoLigerKernelForCausalLM.from_pretrained,
+                pretrained_model_name_or_path=args.model_name_or_path,
                 revision=args.model_revision,
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
                 trust_remote_code=tc.trust_remote_code,
                 low_cpu_mem_usage=args.low_cpu_mem_usage,
                 attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
-                # liger-kernel specific args
                 fused_linear_cross_entropy=True,
             )
         else:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
+            model = _load_model_with_vocab_retry(
+                AutoModelForCausalLM.from_pretrained,
+                pretrained_model_name_or_path=args.model_name_or_path,
                 revision=args.model_revision,
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,

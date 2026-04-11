@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import torch
@@ -10,6 +11,10 @@ from open_instruct.llopa_adapter import PREFILL_LOWER_SYSTEM_LEN_KEY, install_ll
 
 
 class DummyTokenizer:
+    class _Encoding:
+        def __init__(self, input_ids: torch.Tensor):
+            self.input_ids = input_ids
+
     def _render(self, conversation, add_generation_prompt: bool = False) -> str:
         parts = []
         for msg in conversation:
@@ -38,6 +43,12 @@ class DummyTokenizer:
             ids = ids[: int(max_length)]
         return torch.tensor([ids], dtype=torch.long)
 
+    def __call__(self, text, add_special_tokens=False, return_tensors="pt"):
+        assert not add_special_tokens
+        assert return_tensors == "pt"
+        ids = torch.tensor([[ord(ch) + 1 for ch in text]], dtype=torch.long)
+        return self._Encoding(ids)
+
 
 def _tri_module():
     repo_root = Path(__file__).resolve().parents[2]
@@ -46,6 +57,22 @@ def _tri_module():
     import transformers.models.llama.modeling_llama as tri_llama
 
     return tri_llama
+
+
+def _llopa_inference_module():
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parents[2]
+    capsule_root = repo_root / "Capsule"
+    if str(capsule_root) not in sys.path:
+        sys.path.insert(0, str(capsule_root))
+    module_path = repo_root / "Capsule" / "llopa_inference.py"
+    spec = importlib.util.spec_from_file_location("capsule_test_llopa_inference", str(module_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load llopa_inference module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _make_tiny_model():
@@ -514,6 +541,188 @@ def test_prefill_decode_with_inband_fusion_uses_mutated_sequence_without_upper_o
     assert not bool(getattr(outputs.past_key_values, "_capsule_suffix_specials_written", False))
     assert tri_llama._layer_past_len(outputs.past_key_values, 0) == 10
     assert tri_llama._layer_past_len(outputs.past_key_values, 1) == 8
+
+
+def test_unified_generate_inband_prefill_matches_runtime_prefill_reference():
+    _, model = _make_tiny_model()
+    model.config.capsule_num_suffix_specials = 2
+    model.config.capsule_suffix_special_token_ids = [250, 251]
+    model.config.capsule_fusion_mode = "inband"
+    tokenizer = DummyTokenizer()
+    llopa_inference = _llopa_inference_module()
+
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "user"},
+    ]
+    bundle = llopa_inference._build_unified_prefill_lower_prompt_bundle(
+        tokenizer,
+        prompt_messages=messages,
+        prompt_add_generation_prompt=True,
+        structured_prompt_segments=None,
+        device=torch.device("cpu"),
+    )
+
+    with torch.no_grad():
+        unified_out = llopa_inference._direct_llopa_generate_impl(
+            model,
+            tokenizer,
+            prompt_messages=messages,
+            prompt_add_generation_prompt=True,
+            structured_prompt_segments=bundle["segments"],
+            input_ids=bundle["prompt_ids"],
+            attention_mask=bundle["attention_mask"],
+            lower_k=1,
+            prefill_attn="causal",
+            system_prefill="full",
+            user_prefill="full",
+            no_upper_attn=False,
+            max_new_tokens=1,
+            do_sample=False,
+            output_scores=True,
+            return_dict_in_generate=True,
+            use_cache=True,
+        )
+        direct_scores = unified_out.scores
+        assert direct_scores is not None and len(direct_scores) == 1
+        direct_logits = direct_scores[0]
+
+        seed = model.llopa_reference_prefill_seed(
+            system_ids=bundle["segments"]["system_ids"],
+            user_ids=bundle["segments"]["user_ids"],
+            assistant_ids=bundle["segments"]["assistant_prefill_ids"],
+            lower_k=1,
+            prefill_attn="causal",
+            system_prefill="full",
+            no_upper_attn=False,
+        )
+        assert seed is not None
+        pkv, S, U, tri_logits = seed
+        assert pkv is not None
+        assert S >= 0 and U >= 0
+        tri_logits = tri_logits.to(torch.float32)
+
+    torch.testing.assert_close(direct_logits, tri_logits)
+
+
+def test_unified_generate_inband_returns_effective_prompt_prefix():
+    tri_llama, model = _make_tiny_model()
+    model.config.capsule_num_suffix_specials = 2
+    model.config.capsule_suffix_special_token_ids = [250, 251]
+    model.config.capsule_fusion_mode = "inband"
+    tokenizer = DummyTokenizer()
+    llopa_inference = _llopa_inference_module()
+
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "user"},
+        {"role": "assistant", "content": "Answer:"},
+    ]
+    bundle = llopa_inference._build_unified_prefill_lower_prompt_bundle(
+        tokenizer,
+        prompt_messages=messages,
+        prompt_add_generation_prompt=False,
+        structured_prompt_segments=None,
+        device=torch.device("cpu"),
+    )
+    mutated_input_ids, mutated_attention_mask, _, _, _, _ = tri_llama._tri_insert_suffix_specials_inband(
+        token_ids=[250, 251],
+        input_ids=bundle["prompt_ids"],
+        attention_mask=bundle["attention_mask"],
+        labels=None,
+        split_starts=bundle["prefill_lower_split_start"],
+        assistant_header_starts=bundle["assistant_header_starts"],
+        assistant_header_start_mask=bundle["assistant_header_start_mask"],
+    )
+
+    with torch.no_grad():
+        out = llopa_inference._direct_llopa_generate_impl(
+            model,
+            tokenizer,
+            prompt_messages=messages,
+            prompt_add_generation_prompt=False,
+            structured_prompt_segments=bundle["segments"],
+            input_ids=mutated_input_ids,
+            attention_mask=mutated_attention_mask,
+            lower_k=1,
+            prefill_attn="causal",
+            system_prefill="full",
+            user_prefill="full",
+            no_upper_attn=False,
+            max_new_tokens=1,
+            do_sample=False,
+            output_scores=False,
+            return_dict_in_generate=True,
+            use_cache=True,
+        )
+
+    assert out is not None
+    torch.testing.assert_close(
+        out.sequences[0, : mutated_input_ids.size(1)],
+        mutated_input_ids[0],
+    )
+
+
+def test_unified_generate_inband_multiturn_uses_provided_input_ids_prefix():
+    _, model = _make_tiny_model()
+    model.config.capsule_num_suffix_specials = 2
+    model.config.capsule_suffix_special_token_ids = [250, 251]
+    model.config.capsule_fusion_mode = "inband"
+    tokenizer = DummyTokenizer()
+    llopa_inference = _llopa_inference_module()
+
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "Answer:"},
+    ]
+    bundle = llopa_inference._build_unified_prefill_lower_prompt_bundle(
+        tokenizer,
+        prompt_messages=messages,
+        prompt_add_generation_prompt=False,
+        structured_prompt_segments=None,
+        device=torch.device("cpu"),
+    )
+    split_start = int(bundle["prefill_lower_split_start"][0].item())
+    suffix_ids = torch.tensor([[250, 251]], dtype=bundle["prompt_ids"].dtype)
+    mutated_input_ids = torch.cat(
+        [
+            bundle["prompt_ids"][:, :split_start],
+            suffix_ids,
+            bundle["prompt_ids"][:, split_start:],
+        ],
+        dim=1,
+    )
+    mutated_attention_mask = torch.ones_like(mutated_input_ids, dtype=torch.long)
+
+    with torch.no_grad():
+        out = llopa_inference._direct_llopa_generate_impl(
+            model,
+            tokenizer,
+            prompt_messages=messages,
+            prompt_add_generation_prompt=False,
+            structured_prompt_segments=bundle["segments"],
+            input_ids=mutated_input_ids,
+            attention_mask=mutated_attention_mask,
+            lower_k=1,
+            prefill_attn="causal",
+            system_prefill="full",
+            user_prefill="full",
+            no_upper_attn=False,
+            max_new_tokens=1,
+            do_sample=False,
+            output_scores=False,
+            return_dict_in_generate=True,
+            use_cache=True,
+        )
+
+    assert out is not None
+    torch.testing.assert_close(
+        out.sequences[0, : mutated_input_ids.size(1)],
+        mutated_input_ids[0],
+    )
 
 
 def test_single_turn_metadata_does_not_change_prefill_lower_loss():
