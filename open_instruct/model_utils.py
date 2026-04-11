@@ -638,10 +638,34 @@ def save_with_accelerate(
             tokenizer.save_pretrained(output_dir)
         return
 
+    save_lora_locally = (
+        use_lora
+        and accelerator.distributed_type == DistributedType.DEEPSPEED
+        and getattr(accelerator, "num_processes", 1) == 1
+    )
+    if save_lora_locally:
+        if accelerator.is_main_process:
+            logger.info(
+                "Saving LoRA adapter via local PEFT save path at %s to avoid DeepSpeed ZeRO consolidation hangs.",
+                output_dir,
+            )
+            unwrapped_model.save_pretrained(output_dir)
+            logger.info("Finished local PEFT adapter save at %s", output_dir)
+            tokenizer.save_pretrained(output_dir)
+        return
+
     # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
     # Otherwise, sometimes the model will be saved with only part of the parameters.
     # Also, accelerator needs to use the wrapped model to get the state_dict.
+    logger.info(
+        "Collecting state dict for save at %s (distributed_type=%s, use_lora=%s, num_processes=%s)",
+        output_dir,
+        accelerator.distributed_type,
+        use_lora,
+        getattr(accelerator, "num_processes", 1),
+    )
     state_dict = accelerator.get_state_dict(model)
+    logger.info("Finished state dict collection for save at %s", output_dir)
 
     # if we are saving a specific attribute of the model, we need to filter the state_dict
     # also the state_dict only lives in the main process; other processes just have state_dict = None
@@ -659,9 +683,11 @@ def save_with_accelerate(
         # and has its own save_pretrained function for only saving lora modules.
         # We have to manually specify the is_main_process outside the save_pretrained function.
         if accelerator.is_main_process:
+            logger.info("Saving LoRA adapter with consolidated state dict at %s", output_dir)
             unwrapped_model.save_pretrained(output_dir, state_dict=state_dict)
     else:
         # don't use safetensors for saving for now
+        logger.info("Saving full model with consolidated state dict at %s", output_dir)
         unwrapped_model.save_pretrained(
             output_dir,
             is_main_process=accelerator.is_main_process,

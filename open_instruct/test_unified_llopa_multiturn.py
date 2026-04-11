@@ -805,3 +805,75 @@ def test_multiturn_one_shot_matches_sequential_upper_loss():
 
     torch.testing.assert_close(one_shot.loss, batched_loss)
     torch.testing.assert_close(one_shot.loss, sequential_loss, rtol=1e-5, atol=1e-6)
+
+
+def test_single_turn_prefill_lower_gradients_reach_prefix_tokens_and_both_stacks():
+    _, model = _make_tiny_model()
+    model.train()
+    batch = _make_single_turn_batch()
+
+    outputs = model(
+        **batch,
+        use_cache=False,
+        prefill_lower_layers=1,
+        prefill_lower_attn="causal",
+        prefill_lower_system_prefill="full",
+    )
+    outputs.loss.backward()
+
+    embed_grad = model.model.embed_tokens.weight.grad
+    assert embed_grad is not None
+    assert float(embed_grad[10].norm().item()) > 0.0  # system token
+    assert float(embed_grad[20].norm().item()) > 0.0  # user token
+    assert float(embed_grad[30].norm().item()) > 0.0  # assistant header token
+    assert float(embed_grad[40].norm().item()) > 0.0  # supervised assistant token
+    assert float(model.model.layers[0].self_attn.q_proj.weight.grad.norm().item()) > 0.0
+    assert float(model.model.layers[1].self_attn.q_proj.weight.grad.norm().item()) > 0.0
+
+
+def test_multiturn_prefill_lower_gradients_reach_earlier_prefix_tokens():
+    _, model = _make_tiny_model()
+    model.train()
+    batch = _make_multi_turn_batch()
+
+    outputs = model(
+        **batch,
+        use_cache=False,
+        prefill_lower_layers=1,
+        prefill_lower_attn="causal",
+        prefill_lower_system_prefill="full",
+    )
+    outputs.loss.backward()
+
+    embed_grad = model.model.embed_tokens.weight.grad
+    assert embed_grad is not None
+    assert float(embed_grad[10].norm().item()) > 0.0  # system token
+    assert float(embed_grad[20].norm().item()) > 0.0  # first user turn
+    assert float(embed_grad[30].norm().item()) > 0.0  # first assistant header
+    assert float(embed_grad[50].norm().item()) > 0.0  # second user turn
+    assert float(embed_grad[60].norm().item()) > 0.0  # final assistant header
+    assert float(model.model.layers[0].self_attn.q_proj.weight.grad.norm().item()) > 0.0
+    assert float(model.model.layers[1].self_attn.q_proj.weight.grad.norm().item()) > 0.0
+
+
+def test_upper_only_fusion_specials_receive_training_gradients():
+    _, model = _make_tiny_model()
+    model.train()
+    model.config.capsule_num_suffix_specials = 2
+    model.config.capsule_suffix_special_token_ids = [250, 251]
+    model.config.capsule_fusion_mode = "upper_only"
+    batch = _make_single_turn_batch()
+
+    outputs = model(
+        **batch,
+        use_cache=False,
+        prefill_lower_layers=1,
+        prefill_lower_attn="causal",
+        prefill_lower_system_prefill="full",
+    )
+    outputs.loss.backward()
+
+    embed_grad = model.model.embed_tokens.weight.grad
+    assert embed_grad is not None
+    assert float(embed_grad[250].norm().item()) > 0.0
+    assert float(embed_grad[251].norm().item()) > 0.0
