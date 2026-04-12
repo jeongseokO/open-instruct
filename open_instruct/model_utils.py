@@ -19,6 +19,7 @@ import gc
 import itertools
 import json
 import pathlib
+import re
 import tempfile
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
@@ -151,6 +152,111 @@ def _save_zero_checkpoint_with_dtype(
         }
         with open(output_path / "pytorch_model.bin.index.json", "w", encoding="utf-8") as f:
             f.write(json.dumps(index, indent=2, sort_keys=True) + "\n")
+
+
+def _clone_tensor_for_state_dict(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.detach().cpu().clone()
+
+
+def _gather_tensor_for_state_dict(tensor: torch.Tensor) -> torch.Tensor:
+    if hasattr(tensor, "ds_id"):
+        with deepspeed.zero.GatheredParameters([tensor], modifier_rank=None):
+            return _clone_tensor_for_state_dict(tensor)
+    return _clone_tensor_for_state_dict(tensor)
+
+
+def _resolve_embedding_module_names(module: torch.nn.Module) -> list[str]:
+    resolved_names: list[str] = []
+    seen_module_ids: set[int] = set()
+    named_modules = dict(module.named_modules())
+    for getter_name in ("get_input_embeddings", "get_output_embeddings"):
+        getter = getattr(module, getter_name, None)
+        if getter is None:
+            continue
+        try:
+            embedding_module = getter()
+        except Exception:
+            continue
+        if embedding_module is None or id(embedding_module) in seen_module_ids:
+            continue
+        for module_name, named_module in named_modules.items():
+            if named_module is embedding_module:
+                resolved_names.append(module_name)
+                seen_module_ids.add(id(embedding_module))
+                break
+    return resolved_names
+
+
+def _should_save_peft_embedding_layers(module: torch.nn.Module) -> bool:
+    peft_config = getattr(module, "peft_config", None) or {}
+    if not peft_config:
+        return False
+
+    try:
+        from peft.utils.other import EMBEDDING_LAYER_NAMES, match_target_against_key
+    except Exception:
+        EMBEDDING_LAYER_NAMES = ("embed_tokens", "lm_head")
+        match_target_against_key = None
+
+    current_vocab_size = getattr(getattr(module, "config", None), "vocab_size", None)
+
+    for config in peft_config.values():
+        target_modules = getattr(config, "target_modules", None)
+        if isinstance(target_modules, str):
+            base_model = module.get_base_model() if hasattr(module, "get_base_model") else module
+            for module_name, _ in base_model.named_modules():
+                if not any(re.match(rf"(.*\.)?{embedding_name}$", module_name) for embedding_name in EMBEDDING_LAYER_NAMES):
+                    continue
+                if match_target_against_key is not None and match_target_against_key(target_modules, module_name):
+                    return True
+        elif target_modules and any(name in target_modules for name in EMBEDDING_LAYER_NAMES):
+            return True
+
+        model_id = getattr(config, "base_model_name_or_path", None)
+        if current_vocab_size is None or not model_id:
+            continue
+        try:
+            base_config = module.config.__class__.from_pretrained(model_id, local_files_only=True)
+        except Exception:
+            continue
+        if getattr(base_config, "vocab_size", None) != current_vocab_size:
+            return True
+
+    return False
+
+
+def _collect_peft_candidate_state_dict(
+    module: torch.nn.Module,
+    *,
+    include_embedding_layers: bool = False,
+) -> dict[str, torch.Tensor]:
+    state_dict: dict[str, torch.Tensor] = {}
+    peft_config = getattr(module, "peft_config", None) or {}
+    include_all_biases = any(getattr(config, "bias", "none") != "none" for config in peft_config.values())
+
+    def _add_entry(name: str, tensor: torch.Tensor) -> None:
+        if name in state_dict:
+            return
+        state_dict[name] = _gather_tensor_for_state_dict(tensor)
+
+    for name, param in module.named_parameters():
+        should_include = param.requires_grad or "lora_" in name or ".modules_to_save." in name
+        if include_all_biases and name.endswith("bias"):
+            should_include = True
+        if should_include:
+            _add_entry(name, param)
+
+    if include_embedding_layers:
+        named_modules = dict(module.named_modules())
+        for embedding_module_name in _resolve_embedding_module_names(module):
+            embedding_module = named_modules.get(embedding_module_name)
+            if embedding_module is None:
+                continue
+            for child_name, param in embedding_module.named_parameters(recurse=True):
+                full_name = f"{embedding_module_name}.{child_name}" if child_name else embedding_module_name
+                _add_entry(full_name, param)
+
+    return state_dict
 
 
 @dataclass
@@ -645,11 +751,26 @@ def save_with_accelerate(
     )
     if save_lora_locally:
         if accelerator.is_main_process:
+            save_embedding_layers = _should_save_peft_embedding_layers(unwrapped_model)
             logger.info(
-                "Saving LoRA adapter via local PEFT save path at %s to avoid DeepSpeed ZeRO consolidation hangs.",
+                "Saving LoRA adapter via PEFT-compatible targeted gather at %s (save_embedding_layers=%s).",
+                output_dir,
+                save_embedding_layers,
+            )
+            adapter_state_dict = _collect_peft_candidate_state_dict(
+                unwrapped_model,
+                include_embedding_layers=save_embedding_layers,
+            )
+            logger.info(
+                "Collected %s PEFT candidate tensors for local save at %s",
+                len(adapter_state_dict),
                 output_dir,
             )
-            unwrapped_model.save_pretrained(output_dir)
+            unwrapped_model.save_pretrained(
+                output_dir,
+                state_dict=adapter_state_dict,
+                save_embedding_layers=save_embedding_layers,
+            )
             logger.info("Finished local PEFT adapter save at %s", output_dir)
             tokenizer.save_pretrained(output_dir)
         return
