@@ -877,3 +877,196 @@ def test_upper_only_fusion_specials_receive_training_gradients():
     assert embed_grad is not None
     assert float(embed_grad[250].norm().item()) > 0.0
     assert float(embed_grad[251].norm().item()) > 0.0
+
+
+def test_last_layer_module_none_matches_default_unified_forward():
+    _, model = _make_tiny_model()
+    model.eval()
+    batch = _make_single_turn_batch()
+
+    with torch.no_grad():
+        default_out = model(
+            **batch,
+            use_cache=False,
+            prefill_lower_layers=1,
+            prefill_lower_attn="causal",
+            prefill_lower_system_prefill="full",
+        )
+        none_out = model(
+            **batch,
+            use_cache=False,
+            prefill_lower_layers=1,
+            prefill_lower_attn="causal",
+            prefill_lower_system_prefill="full",
+            prefill_lower_replay_module="none",
+        )
+
+    torch.testing.assert_close(default_out.loss, none_out.loss)
+    torch.testing.assert_close(default_out.logits, none_out.logits)
+
+
+def test_replay_layer_index_schedule_matches_upper_layer_counting_rule():
+    tri_llama, _ = _make_tiny_model()
+
+    assert tri_llama._tri_replay_layer_index_set(upper_layer_indices=[27, 28, 29, 30, 31], replay_per_layers=-1) == {31}
+    assert tri_llama._tri_replay_layer_index_set(upper_layer_indices=[27, 28, 29, 30, 31], replay_per_layers=1) == {27, 28, 29, 30, 31}
+    assert tri_llama._tri_replay_layer_index_set(upper_layer_indices=[27, 28, 29, 30, 31], replay_per_layers=2) == {28, 30}
+    assert tri_llama._tri_replay_layer_index_set(upper_layer_indices=[27, 28, 29, 30, 31], replay_per_layers=4) == {30}
+
+
+def test_last_layer_module_self_and_cross_support_training_backward():
+    batch = _make_single_turn_batch()
+
+    for mode in ("self", "cross"):
+        _, model = _make_tiny_model()
+        model.train()
+        outputs = model(
+            **batch,
+            use_cache=False,
+            prefill_lower_layers=1,
+            prefill_lower_attn="causal",
+            prefill_lower_system_prefill="full",
+            prefill_lower_replay_module=mode,
+        )
+
+        assert outputs.loss is not None
+        assert torch.isfinite(outputs.loss)
+
+        outputs.loss.backward()
+
+        final_q_grad = model.model.layers[-1].self_attn.q_proj.weight.grad
+        assert final_q_grad is not None
+        assert torch.isfinite(final_q_grad).all()
+
+
+def test_last_layer_module_vanilla_prefill_decode_avoids_duplicate_lower_pass():
+    tri_llama, model = _make_tiny_model()
+    model.eval()
+    batch = _make_single_turn_batch()
+    original = tri_llama._tri_prefill_lower_prompt_hidden
+
+    def _unexpected_second_pass(*args, **kwargs):
+        raise AssertionError("duplicate lower hidden replay pass should not run")
+
+    tri_llama._tri_prefill_lower_prompt_hidden = _unexpected_second_pass
+    try:
+        with torch.no_grad():
+            outputs = model(
+                **batch,
+                use_cache=False,
+                prefill_lower_layers=1,
+                prefill_lower_attn="causal",
+                prefill_lower_system_prefill="full",
+                prefill_lower_replay_module="self",
+            )
+    finally:
+        tri_llama._tri_prefill_lower_prompt_hidden = original
+
+    assert outputs.loss is not None
+    assert torch.isfinite(outputs.loss)
+
+
+def test_last_layer_module_self_skips_replay_branch():
+    tri_llama, model = _make_tiny_model()
+    batch = _make_single_turn_batch()
+    original_replay = tri_llama._tri_replay_attention_forward
+
+    def _unexpected_replay(*args, **kwargs):
+        raise AssertionError("self mode should not invoke the separate replay branch")
+
+    tri_llama._tri_replay_attention_forward = _unexpected_replay
+    try:
+        outputs = model(
+            **batch,
+            use_cache=False,
+            prefill_lower_layers=1,
+            prefill_lower_attn="causal",
+            prefill_lower_system_prefill="full",
+            prefill_lower_replay_module="self",
+        )
+    finally:
+        tri_llama._tri_replay_attention_forward = original_replay
+
+    assert outputs.loss is not None
+    assert torch.isfinite(outputs.loss)
+
+
+def test_last_layer_module_integrated_self_and_cross_flash_attention_dispatch_shapes():
+    tri_llama, model = _make_tiny_model()
+    attn = model.model.layers[-1].self_attn
+    attn.config._attn_implementation = "flash_attention_2"
+    attn.layer_idx = model.config.num_hidden_layers - 1
+
+    hidden_states = torch.randn(1, 4, model.config.hidden_size)
+    memory_hidden_states = torch.randn(1, 3, model.config.hidden_size)
+    query_position_ids = torch.tensor([[5, 6, 7, 8]], dtype=torch.long)
+    memory_position_ids = torch.tensor([[2, 3, 4]], dtype=torch.long)
+    query_pos_emb = model.model.rotary_emb(hidden_states, query_position_ids)
+    memory_pos_emb = model.model.rotary_emb(memory_hidden_states, memory_position_ids)
+    memory_key_states, memory_value_states = tri_llama._tri_project_memory_kv(
+        attn_module=attn,
+        memory_hidden_states=memory_hidden_states,
+        memory_position_embeddings=memory_pos_emb,
+        target_device=hidden_states.device,
+        target_dtype=hidden_states.dtype,
+    )
+
+    original_flash = tri_llama.ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+    original_resolve = tri_llama._resolve_attn_impl
+    calls = []
+
+    def _fake_flash(module, query, key, value, attention_mask, dropout=0.0, scaling=None, **kwargs):
+        calls.append(
+            {
+                "attention_mask_shape": None if attention_mask is None else tuple(attention_mask.shape),
+                "has_cu_q": "cu_seq_lens_q" in kwargs,
+                "has_cu_k": "cu_seq_lens_k" in kwargs,
+                "max_length_q": kwargs.get("max_length_q"),
+                "max_length_k": kwargs.get("max_length_k"),
+                "is_causal": bool(module.is_causal),
+            }
+        )
+        return query.transpose(1, 2).new_zeros((query.size(0), query.size(2), query.size(1), query.size(3))), None
+
+    tri_llama.ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = _fake_flash
+    tri_llama._resolve_attn_impl = lambda config: "flash_attention_2"
+    try:
+        self_out, _ = attn(
+            hidden_states=hidden_states,
+            position_embeddings=query_pos_emb,
+            attention_mask=None,
+            past_key_values=None,
+            cache_position=torch.arange(hidden_states.size(1), dtype=torch.long),
+            position_ids=query_position_ids,
+            extra_prefix_kv=(memory_key_states, memory_value_states),
+            extra_prefix_valid_mask=torch.ones((1, 3), dtype=torch.bool),
+            extra_prefix_query_mask=torch.ones((1, 4), dtype=torch.bool),
+            extra_prefix_local_valid_mask=torch.ones((1, 4), dtype=torch.bool),
+        )
+        cross_out = tri_llama._tri_replay_attention_forward(
+            attn_module=attn,
+            hidden_states=hidden_states,
+            position_embeddings=query_pos_emb,
+            local_valid_mask=torch.ones((1, 4), dtype=torch.bool),
+            query_replay_mask=torch.ones((1, 4), dtype=torch.bool),
+            memory_hidden_states=memory_hidden_states,
+            memory_position_embeddings=memory_pos_emb,
+            memory_valid_mask=torch.ones((1, 3), dtype=torch.bool),
+            module_type="cross",
+        )
+    finally:
+        tri_llama.ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = original_flash
+        tri_llama._resolve_attn_impl = original_resolve
+
+    assert self_out.shape == hidden_states.shape
+    assert cross_out.shape == hidden_states.shape
+    assert len(calls) == 2
+    assert calls[0]["attention_mask_shape"] is None
+    assert calls[0]["has_cu_q"] is False
+    assert calls[0]["is_causal"] is True
+    assert calls[1]["attention_mask_shape"] is None
+    assert calls[1]["has_cu_q"] is True
+    assert calls[1]["has_cu_k"] is True
+    assert calls[1]["max_length_q"] == 4
+    assert calls[1]["max_length_k"] == 3
+    assert calls[1]["is_causal"] is False

@@ -89,6 +89,7 @@ logger = get_logger(__name__)
 
 
 FUSION_TOKEN_TEMPLATE = "<|FUSION{}|>"
+DEFAULT_LORA_TARGET_MODULES = ["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 def _infer_checkpoint_vocab_size_from_load_error(exc: RuntimeError) -> int | None:
@@ -217,6 +218,72 @@ def _infer_transformer_layers_pattern(model: torch.nn.Module) -> str:
     raise ValueError("Unable to infer transformer layer pattern for train_upper_only LoRA placement.")
 
 
+def _split_lora_target_modules(raw_targets: Any) -> list[str]:
+    if raw_targets is None:
+        return []
+    if isinstance(raw_targets, str):
+        values = [raw_targets]
+    else:
+        values = list(raw_targets)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        for piece in text.replace(",", " ").split():
+            token = piece.strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def _infer_all_linear_lora_targets(model: torch.nn.Module) -> list[str]:
+    transformer_root = model
+    for attr in ("model", "transformer"):
+        candidate = getattr(model, attr, None)
+        if isinstance(candidate, torch.nn.Module):
+            transformer_root = candidate
+            break
+
+    def _collect(root: torch.nn.Module) -> list[str]:
+        skip_leaf_names = {"lm_head", "embed_out", "output", "output_projection"}
+        found: list[str] = []
+        seen: set[str] = set()
+        for name, module in root.named_modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            leaf_name = name.rsplit(".", 1)[-1]
+            if leaf_name in skip_leaf_names or leaf_name in seen:
+                continue
+            seen.add(leaf_name)
+            found.append(leaf_name)
+        return found
+
+    found = _collect(transformer_root)
+    if not found and transformer_root is not model:
+        found = _collect(model)
+    if not found:
+        raise ValueError("Unable to infer LoRA target modules for all_linear.")
+    return found
+
+
+def _resolve_lora_target_modules(model: torch.nn.Module, raw_targets: Any) -> list[str]:
+    targets = _split_lora_target_modules(raw_targets)
+    if not targets:
+        return list(DEFAULT_LORA_TARGET_MODULES)
+
+    normalized = {target.lower().replace("-", "_") for target in targets}
+    if normalized & {"all_linear", "alllinear"}:
+        if len(targets) != 1:
+            raise ValueError("lora_target_modules cannot mix all_linear with explicit module names.")
+        return _infer_all_linear_lora_targets(model)
+    return targets
+
+
 def _resolve_transformer_layer_container(
     model: torch.nn.Module,
 ) -> tuple[torch.nn.Module, str, torch.nn.ModuleList, str]:
@@ -329,6 +396,9 @@ def _set_capsule_runtime_metadata(model: torch.nn.Module, args) -> None:
         setattr(config, "capsule_system_prefill", str(args.system_prefill))
         setattr(config, "capsule_user_prefill", str(args.user_prefill))
         setattr(config, "capsule_no_upper_attn", bool(args.no_upper_attn))
+        setattr(config, "capsule_replay_module", str(getattr(args, "replay_module", "none")))
+        setattr(config, "capsule_last_layer_module", str(getattr(args, "replay_module", "none")))
+        setattr(config, "capsule_replay_per_layers", int(getattr(args, "replay_per_layers", -1) or -1))
         setattr(config, "capsule_num_suffix_specials", int(getattr(args, "num_suffix_specials", 0) or 0))
         setattr(config, "capsule_fusion_mode", _normalize_fusion_mode(getattr(args, "fusion_mode", "upper_only")))
         suffix_tokens = getattr(config, "capsule_suffix_special_tokens", None)
@@ -349,6 +419,9 @@ def _write_capsule_tri_info(output_dir: str, args) -> None:
         f"system_prefill={str(args.system_prefill)}",
         f"user_prefill={str(args.user_prefill)}",
         f"no_upper_attn={int(bool(args.no_upper_attn))}",
+        f"replay_module={str(getattr(args, 'replay_module', 'none'))}",
+        f"replay_per_layers={int(getattr(args, 'replay_per_layers', -1) or -1)}",
+        f"last_layer_module={str(getattr(args, 'replay_module', 'none'))}",
         f"num_suffix_specials={int(getattr(args, 'num_suffix_specials', 0) or 0)}",
         f"fusion_mode={_normalize_fusion_mode(getattr(args, 'fusion_mode', 'upper_only'))}",
         "capsule_llopa_enabled=1",
@@ -378,6 +451,40 @@ def _use_vanilla_suffix_specials(args) -> bool:
 def _normalize_fusion_mode(mode: Any) -> str:
     normalized = str(mode or "upper_only").strip().lower()
     return normalized or "upper_only"
+
+
+def _normalize_last_layer_module(mode: Any) -> str:
+    normalized = str(mode or "none").strip().lower()
+    aliases = {
+        "": "none",
+        "off": "none",
+        "disabled": "none",
+        "disable": "none",
+        "self-attention": "self",
+        "self_attention": "self",
+        "selfattn": "self",
+        "self_attn": "self",
+        "cross-attention": "cross",
+        "cross_attention": "cross",
+        "crossattn": "cross",
+        "cross_attn": "cross",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized or "none"
+
+
+def _normalize_replay_module(mode: Any) -> str:
+    return _normalize_last_layer_module(mode)
+
+
+def _normalize_replay_per_layers(value: Any) -> int:
+    try:
+        normalized = int(value)
+    except Exception as exc:
+        raise ValueError("replay_per_layers must be an integer.") from exc
+    if normalized == -1 or normalized >= 1:
+        return normalized
+    raise ValueError("replay_per_layers must be -1 or a positive integer.")
 
 
 class VanillaSuffixSpecialDataCollator:
@@ -603,6 +710,15 @@ class FlatArguments:
     lora_rank: int = field(default=64, metadata={"help": "The rank of lora."})
     lora_alpha: float = field(default=16, metadata={"help": "The alpha parameter of lora."})
     lora_dropout: float = field(default=0.1, metadata={"help": "The dropout rate of lora modules."})
+    lora_target_modules: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Optional LoRA target modules. Pass explicit module names or the special alias "
+                "'all_linear' (or 'all-linear') to target all transformer linear layers except the LM head."
+            )
+        },
+    )
     train_upper_only: int = field(
         default=0,
         metadata={
@@ -665,6 +781,28 @@ class FlatArguments:
     no_upper_attn: bool = field(
         default=False,
         metadata={"help": "Unified LLoPA decode optimization: skip upper-layer attention."},
+    )
+    replay_module: str = field(
+        default="none",
+        metadata={
+            "help": (
+                "Replay lower-prefill hidden states in upper layers: "
+                "none | self | cross."
+            )
+        },
+    )
+    replay_per_layers: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "Replay schedule across upper layers: -1 for the last upper layer only, "
+                "or positive N for every N upper layers counted from the upper start."
+            )
+        },
+    )
+    last_layer_module: str | None = field(
+        default=None,
+        metadata={"help": "Deprecated alias for --replay_module."},
     )
     num_suffix_specials: int = field(
         default=0,
@@ -919,6 +1057,13 @@ class FlatArguments:
         if self.num_suffix_specials > 0 and str(self.modeling_family or "llama").strip().lower() != "llama":
             raise NotImplementedError("num_suffix_specials currently supports modeling_family='llama' only.")
         self.fusion_mode = _normalize_fusion_mode(self.fusion_mode)
+        if self.last_layer_module is not None and _normalize_replay_module(self.replay_module) == "none":
+            self.replay_module = self.last_layer_module
+        self.replay_module = _normalize_replay_module(self.replay_module)
+        if self.replay_module not in {"none", "self", "cross"}:
+            raise ValueError("replay_module must be one of {'none', 'self', 'cross'}.")
+        self.replay_per_layers = _normalize_replay_per_layers(self.replay_per_layers)
+        self.last_layer_module = self.replay_module
         if self.fusion_mode not in {"upper_only", "inband"}:
             raise ValueError("fusion_mode must be one of {'upper_only', 'inband'}.")
         if self.prefill_attn not in {"causal", "full"}:
@@ -957,6 +1102,15 @@ class FlatArguments:
                 raise ValueError("prefill_lower_solo_attention cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
             if self.load_balancing_loss:
                 raise ValueError("prefill_lower_solo_attention does not support load_balancing_loss.")
+        if self.replay_module != "none":
+            if str(self.modeling_family or "llama").strip().lower() != "llama":
+                raise NotImplementedError("replay_module currently supports modeling_family='llama' only.")
+            if self.no_upper_layers:
+                raise ValueError("replay_module cannot be combined with --no_upper_layers.")
+            if self.prefill_lower_freeze:
+                raise ValueError("replay_module cannot be combined with --prefill_lower_freeze.")
+            if self.prefill_lower_solo_attention:
+                raise ValueError("replay_module cannot be combined with --prefill_lower_solo_attention.")
         if self.unified_llopa:
             if self.lower_layers <= 0:
                 raise ValueError("unified_llopa requires lower_layers > 0.")
@@ -978,8 +1132,12 @@ class FlatArguments:
                 raise ValueError("unified_llopa cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
             if self.no_upper_layers:
                 raise ValueError("unified_llopa cannot be combined with --no_upper_layers.")
+            if self.replay_module != "none" and self.no_upper_attn:
+                raise ValueError("replay_module cannot be combined with --no_upper_attn.")
         elif self.fusion_mode == "inband":
             raise ValueError("fusion_mode='inband' is supported with --unified_llopa only.")
+        elif self.replay_module != "none" and self.prefill_lower_layers <= 0:
+            raise ValueError("replay_module requires --unified_llopa or --prefill_lower_layers > 0.")
         if self.no_upper_layers:
             if self.prefill_lower_layers <= 0:
                 raise ValueError("no_upper_layers requires prefill_lower_layers > 0.")
@@ -1215,12 +1373,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         install_llopa_modeling(modeling_path=modeling_path, model_family=args.modeling_family)
         if args.unified_llopa:
             logger.info(
-                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | fusion_mode=%s | num_suffix_specials=%s | modeling=%s | family=%s",
+                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | replay_module=%s | replay_per_layers=%s | fusion_mode=%s | num_suffix_specials=%s | modeling=%s | family=%s",
                 args.lower_layers,
                 args.prefill_mode,
                 args.prefill_attn,
                 args.system_prefill,
                 args.no_upper_attn,
+                args.replay_module,
+                args.replay_per_layers,
                 _normalize_fusion_mode(args.fusion_mode),
                 args.num_suffix_specials,
                 modeling_path,
@@ -1479,13 +1639,15 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             model.gradient_checkpointing_enable()
 
         logger.info("Initializing LORA model...")
+        target_modules = _resolve_lora_target_modules(model, getattr(args, "lora_target_modules", []))
+        logger.info("LoRA target_modules=%s", target_modules)
         peft_config_kwargs = dict(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
             r=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=target_modules,
         )
         if args.train_upper_only > 0:
             num_hidden_layers = getattr(config, "num_hidden_layers", None)
@@ -1810,6 +1972,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_lower_attn=str(args.prefill_attn),
                             prefill_lower_system_prefill=str(args.system_prefill),
                             prefill_lower_no_upper_attn=bool(args.no_upper_attn),
+                            prefill_lower_replay_module=str(args.replay_module),
+                            prefill_lower_replay_per_layers=int(args.replay_per_layers),
                         )
                         loss = outputs.loss
                         del outputs
@@ -1853,6 +2017,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_lower_attn=str(args.prefill_lower_attn),
                             prefill_lower_system_prefill=str(args.llopa_system_prefill),
                             prefill_lower_solo_attention=bool(args.prefill_lower_solo_attention),
+                            prefill_lower_replay_module=str(args.replay_module),
+                            prefill_lower_replay_per_layers=int(args.replay_per_layers),
                             skip_upper_attention_layers=int(args.skip_upper_attention_layers),
                             solo_attention_layers=int(args.solo_attention_layers),
                         )
@@ -1884,6 +2050,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_lower_attn=str(args.prefill_lower_attn),
                             prefill_lower_system_prefill=str(args.llopa_system_prefill),
                             prefill_lower_solo_attention=bool(args.prefill_lower_solo_attention),
+                            prefill_lower_replay_module=str(args.replay_module),
+                            prefill_lower_replay_per_layers=int(args.replay_per_layers),
                             skip_upper_attention_layers=int(args.skip_upper_attention_layers),
                             solo_attention_layers=int(args.solo_attention_layers),
                         )
