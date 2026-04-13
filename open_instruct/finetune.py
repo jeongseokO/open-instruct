@@ -397,9 +397,10 @@ def _maybe_wait_for_everyone(accelerator: Accelerator, *, reason: str) -> None:
 
 
 def _set_capsule_runtime_metadata(model: torch.nn.Module, args) -> None:
-    if not bool(getattr(args, "unified_llopa", False)):
-        return
     for config in _iter_model_configs(model):
+        setattr(config, "capsule_attention_gate_mode", str(getattr(args, "attention_gate_mode", "off")))
+        if not bool(getattr(args, "unified_llopa", False)):
+            continue
         setattr(config, "capsule_llopa_enabled", True)
         setattr(config, "capsule_lower_layers", int(args.lower_layers))
         setattr(config, "capsule_prefill_mode", str(args.prefill_mode))
@@ -421,9 +422,20 @@ def _set_capsule_runtime_metadata(model: torch.nn.Module, args) -> None:
 
 
 def _write_capsule_tri_info(output_dir: str, args) -> None:
-    if not output_dir or not bool(getattr(args, "unified_llopa", False)):
+    gate_mode = str(getattr(args, "attention_gate_mode", "off"))
+    if not output_dir or (
+        not bool(getattr(args, "unified_llopa", False))
+        and gate_mode == "off"
+    ):
         return
     lines = [
+        f"attention_gate_mode={gate_mode}",
+    ]
+    if not bool(getattr(args, "unified_llopa", False)):
+        with open(os.path.join(output_dir, "tri_info.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return
+    lines.extend([
         f"lower_k={int(args.lower_layers)}",
         f"prefill_mode={str(args.prefill_mode)}",
         f"prefill_attn={str(args.prefill_attn)}",
@@ -436,7 +448,7 @@ def _write_capsule_tri_info(output_dir: str, args) -> None:
         f"num_suffix_specials={int(getattr(args, 'num_suffix_specials', 0) or 0)}",
         f"fusion_mode={_normalize_fusion_mode(getattr(args, 'fusion_mode', 'upper_only'))}",
         "capsule_llopa_enabled=1",
-    ]
+    ])
     with open(os.path.join(output_dir, "tri_info.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -462,6 +474,27 @@ def _use_vanilla_suffix_specials(args) -> bool:
 def _normalize_fusion_mode(mode: Any) -> str:
     normalized = str(mode or "upper_only").strip().lower()
     return normalized or "upper_only"
+
+
+def _normalize_attention_gate_mode(mode: Any) -> str:
+    normalized = str(mode or "off").strip().lower()
+    aliases = {
+        "": "off",
+        "none": "off",
+        "disabled": "off",
+        "disable": "off",
+        "false": "off",
+        "0": "off",
+        "paper": "sdpa_sigmoid",
+        "sdpa_gate": "sdpa_sigmoid",
+        "sdpa-gate": "sdpa_sigmoid",
+        "sigmoid_after_sdpa": "sdpa_sigmoid",
+        "sdpa_elementwise_sigmoid": "sdpa_sigmoid",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"off", "sdpa_sigmoid"}:
+        raise ValueError("attention_gate_mode must be one of {'off', 'sdpa_sigmoid'}.")
+    return normalized
 
 
 def _normalize_last_layer_module(mode: Any) -> str:
@@ -793,6 +826,16 @@ class FlatArguments:
         default=False,
         metadata={"help": "Unified LLoPA decode optimization: skip upper-layer attention."},
     )
+    attention_gate_mode: str = field(
+        default="off",
+        metadata={
+            "help": (
+                "Attention gate mode for the whole backbone. "
+                "'sdpa_sigmoid' enables the paper-style head-specific elementwise sigmoid gate after SDPA "
+                "on every layer; 'off' disables it."
+            )
+        },
+    )
     replay_module: str = field(
         default="none",
         metadata={
@@ -1067,6 +1110,7 @@ class FlatArguments:
             raise ValueError("num_suffix_specials requires full-model training (use_lora=False).")
         if self.num_suffix_specials > 0 and str(self.modeling_family or "llama").strip().lower() != "llama":
             raise NotImplementedError("num_suffix_specials currently supports modeling_family='llama' only.")
+        self.attention_gate_mode = _normalize_attention_gate_mode(self.attention_gate_mode)
         self.fusion_mode = _normalize_fusion_mode(self.fusion_mode)
         if self.last_layer_module is not None and _normalize_replay_module(self.replay_module) == "none":
             self.replay_module = self.last_layer_module
@@ -1384,7 +1428,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         install_llopa_modeling(modeling_path=modeling_path, model_family=args.modeling_family)
         if args.unified_llopa:
             logger.info(
-                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | replay_module=%s | replay_per_layers=%s | fusion_mode=%s | num_suffix_specials=%s | modeling=%s | family=%s",
+                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | replay_module=%s | replay_per_layers=%s | fusion_mode=%s | num_suffix_specials=%s | attention_gate_mode=%s | modeling=%s | family=%s",
                 args.lower_layers,
                 args.prefill_mode,
                 args.prefill_attn,
@@ -1394,6 +1438,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 args.replay_per_layers,
                 _normalize_fusion_mode(args.fusion_mode),
                 args.num_suffix_specials,
+                args.attention_gate_mode,
                 modeling_path,
                 args.modeling_family,
             )
@@ -1539,6 +1584,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     setattr(config, "capsule_suffix_special_tokens", list(fusion_tokens))
     setattr(config, "capsule_suffix_special_token_ids", list(fusion_token_ids))
     setattr(config, "capsule_fusion_mode", _normalize_fusion_mode(args.fusion_mode))
+    setattr(config, "capsule_attention_gate_mode", str(args.attention_gate_mode))
     if (
         args.num_suffix_specials > 0
         and args.no_upper_attn

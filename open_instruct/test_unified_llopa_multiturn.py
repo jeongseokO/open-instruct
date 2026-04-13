@@ -937,6 +937,41 @@ def test_last_layer_module_self_and_cross_support_training_backward():
         final_q_grad = model.model.layers[-1].self_attn.q_proj.weight.grad
         assert final_q_grad is not None
         assert torch.isfinite(final_q_grad).all()
+        if mode == "cross":
+            final_layer = model.model.layers[-1]
+            assert final_layer.replay_cross_attn.q_proj.weight is not final_layer.self_attn.q_proj.weight
+            cross_q_grad = final_layer.replay_cross_attn.q_proj.weight.grad
+            assert cross_q_grad is not None
+            assert torch.isfinite(cross_q_grad).all()
+
+
+def test_replay_cross_attention_is_seeded_from_self_attention_on_load():
+    _, src_model = _make_tiny_model()
+    with torch.no_grad():
+        src_model.model.layers[-1].self_attn.q_proj.weight.fill_(0.125)
+        src_model.model.layers[-1].self_attn.o_proj.weight.fill_(0.25)
+
+    state_dict = src_model.state_dict()
+    stripped_state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if ".replay_cross_attn." not in key
+    }
+
+    _, dst_model = _make_tiny_model()
+    missing, unexpected = dst_model.load_state_dict(stripped_state_dict, strict=False)
+    assert all(".replay_cross_attn." not in key for key in missing)
+    assert not unexpected
+
+    final_layer = dst_model.model.layers[-1]
+    torch.testing.assert_close(
+        final_layer.replay_cross_attn.q_proj.weight,
+        final_layer.self_attn.q_proj.weight,
+    )
+    torch.testing.assert_close(
+        final_layer.replay_cross_attn.o_proj.weight,
+        final_layer.self_attn.o_proj.weight,
+    )
 
 
 def test_last_layer_module_vanilla_prefill_decode_avoids_duplicate_lower_pass():
