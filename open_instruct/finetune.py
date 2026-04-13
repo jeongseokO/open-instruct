@@ -69,7 +69,7 @@ from open_instruct.llopa_adapter import (
     install_llopa_modeling,
     normalize_system_prefill,
 )
-from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
+from open_instruct.model_utils import push_folder_to_hub, save_lora_adapter_from_zero_checkpoint, save_with_accelerate
 from open_instruct.padding_free_collator import TensorDataCollatorWithFlattening
 from open_instruct.utils import (
     ArgumentParserPlus,
@@ -383,6 +383,17 @@ def _iter_model_configs(model: torch.nn.Module):
                 base = get_base_model()
                 if isinstance(base, torch.nn.Module):
                     queue.append(base)
+
+
+def _maybe_wait_for_everyone(accelerator: Accelerator, *, reason: str) -> None:
+    if getattr(accelerator, "num_processes", 1) <= 1:
+        logger.info(
+            "Skipping accelerator.wait_for_everyone() at %s because num_processes=%s",
+            reason,
+            getattr(accelerator, "num_processes", 1),
+        )
+        return
+    accelerator.wait_for_everyone()
 
 
 def _set_capsule_runtime_metadata(model: torch.nn.Module, args) -> None:
@@ -1318,7 +1329,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     if accelerator.is_main_process and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    accelerator.wait_for_everyone()
+    _maybe_wait_for_everyone(accelerator, reason="output directory setup")
 
     if args.dataset_mixer is not None:
         args.dataset_mixer_list = [item for pair in args.dataset_mixer.items() for item in pair]
@@ -2254,7 +2265,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                         f.write("COMPLETED")
                     if accelerator.is_local_main_process:
                         clean_last_n_checkpoints(args.output_dir, args.keep_last_n_checkpoints)
-                    accelerator.wait_for_everyone()
+                    _maybe_wait_for_everyone(accelerator, reason=f"checkpoint step_{completed_steps}")
 
                 if completed_steps >= args.max_train_steps:
                     break
@@ -2269,22 +2280,56 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 f.write("COMPLETED")  # annoyingly, empty files arent uploaded by beaker.
             if accelerator.is_local_main_process:
                 clean_last_n_checkpoints(args.output_dir, args.keep_last_n_checkpoints)
-            accelerator.wait_for_everyone()
+            _maybe_wait_for_everyone(accelerator, reason=f"checkpoint epoch_{epoch}")
 
     _set_capsule_runtime_metadata(model, args)
 
     if args.output_dir is not None:
         final_zero_checkpoint_dir = get_last_checkpoint_path(args) if bool(getattr(args, "unified_llopa", False)) else None
-        save_with_accelerate(
-            accelerator,
-            model,
-            tokenizer,
-            args.output_dir,
-            args.use_lora,
-            chat_template_name=tc.chat_template_name,
-            zero3_checkpoint_dir=final_zero_checkpoint_dir,
-            prefer_zero3_offline_merge=bool(getattr(args, "unified_llopa", False)),
+        save_with_offline_zero3_lora = (
+            args.use_lora
+            and bool(getattr(args, "unified_llopa", False))
+            and accelerator.distributed_type == DistributedType.DEEPSPEED
+            and getattr(accelerator, "num_processes", 1) == 1
+            and final_zero_checkpoint_dir is not None
         )
+        if save_with_offline_zero3_lora:
+            if accelerator.is_main_process:
+                logger.info(
+                    "Saving LoRA adapter via offline ZeRO checkpoint package from %s to %s",
+                    final_zero_checkpoint_dir,
+                    args.output_dir,
+                )
+                target_modules = _resolve_lora_target_modules(model, getattr(args, "lora_target_modules", []))
+                offline_result = save_lora_adapter_from_zero_checkpoint(
+                    final_zero_checkpoint_dir,
+                    args.output_dir,
+                    tokenizer=tokenizer,
+                    base_model_name_or_path=args.model_name_or_path,
+                    lora_rank=args.lora_rank,
+                    lora_alpha=args.lora_alpha,
+                    lora_dropout=args.lora_dropout,
+                    target_modules=target_modules,
+                    model_revision=args.model_revision,
+                )
+                logger.info(
+                    "Finished offline LoRA adapter package at %s | checkpoint=%s | adapter_keys=%s | include_embedding_layers=%s",
+                    args.output_dir,
+                    offline_result["checkpoint_path"],
+                    offline_result["adapter_keys"],
+                    offline_result["include_embedding_layers"],
+                )
+        else:
+            save_with_accelerate(
+                accelerator,
+                model,
+                tokenizer,
+                args.output_dir,
+                args.use_lora,
+                chat_template_name=tc.chat_template_name,
+                zero3_checkpoint_dir=final_zero_checkpoint_dir,
+                prefer_zero3_offline_merge=bool(getattr(args, "unified_llopa", False)),
+            )
         if accelerator.is_main_process:
             _write_capsule_tri_info(args.output_dir, args)
 
@@ -2312,7 +2357,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         )
     if args.push_to_hub and accelerator.is_main_process:
         push_folder_to_hub(args.output_dir, args.hf_repo_id, args.hf_repo_revision)
-    accelerator.wait_for_everyone()
+    _maybe_wait_for_everyone(accelerator, reason="train end")
     if args.with_tracking:
         accelerator.end_training()
 

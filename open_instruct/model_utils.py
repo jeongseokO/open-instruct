@@ -18,6 +18,7 @@ import asyncio
 import gc
 import itertools
 import json
+import math
 import pathlib
 import re
 import tempfile
@@ -38,6 +39,7 @@ from rich import print as rprint
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from safetensors.torch import save_file as save_safetensors_file
 from torch.nn.parallel.distributed import DistributedDataParallel
 
 from open_instruct import logger_utils
@@ -232,7 +234,11 @@ def _collect_peft_candidate_state_dict(
 ) -> dict[str, torch.Tensor]:
     state_dict: dict[str, torch.Tensor] = {}
     peft_config = getattr(module, "peft_config", None) or {}
-    include_all_biases = any(getattr(config, "bias", "none") != "none" for config in peft_config.values())
+    include_all_biases = any(getattr(config, "bias", "none") == "all" for config in peft_config.values())
+    include_lora_only_biases = any(getattr(config, "bias", "none") == "lora_only" for config in peft_config.values())
+    bias_names_to_include: set[str] = set()
+    skipped_trainable_names: list[str] = []
+    skipped_trainable_numel = 0
 
     def _add_entry(name: str, tensor: torch.Tensor) -> None:
         if name in state_dict:
@@ -240,11 +246,23 @@ def _collect_peft_candidate_state_dict(
         state_dict[name] = _gather_tensor_for_state_dict(tensor)
 
     for name, param in module.named_parameters():
-        should_include = param.requires_grad or "lora_" in name or ".modules_to_save." in name
+        is_lora_param = "lora_" in name
+        should_include = is_lora_param or ".modules_to_save." in name
         if include_all_biases and name.endswith("bias"):
             should_include = True
+        if include_lora_only_biases and is_lora_param:
+            bias_names_to_include.add(name.split("lora_", 1)[0] + "bias")
         if should_include:
             _add_entry(name, param)
+        elif param.requires_grad:
+            skipped_trainable_numel += int(param.numel())
+            if len(skipped_trainable_names) < 8:
+                skipped_trainable_names.append(name)
+
+    if bias_names_to_include:
+        for name, param in module.named_parameters():
+            if name in bias_names_to_include:
+                _add_entry(name, param)
 
     if include_embedding_layers:
         named_modules = dict(module.named_modules())
@@ -256,7 +274,399 @@ def _collect_peft_candidate_state_dict(
                 full_name = f"{embedding_module_name}.{child_name}" if child_name else embedding_module_name
                 _add_entry(full_name, param)
 
+    if skipped_trainable_numel > 0:
+        logger.info(
+            "Skipping %s non-PEFT trainable parameters during local adapter save (%s tensors, examples=%s)",
+            skipped_trainable_numel,
+            len(skipped_trainable_names),
+            skipped_trainable_names,
+        )
+
     return state_dict
+
+
+def _normalize_zero_checkpoint_dir(checkpoint_dir: str | pathlib.Path) -> pathlib.Path:
+    checkpoint_path = pathlib.Path(checkpoint_dir)
+    if (checkpoint_path / "pytorch_model").is_dir():
+        checkpoint_path = checkpoint_path / "pytorch_model"
+    return checkpoint_path
+
+
+def _load_zero_checkpoint_states(
+    checkpoint_dir: str | pathlib.Path,
+) -> tuple[dict[str, Any], dict[str, Any], pathlib.Path]:
+    checkpoint_path = _normalize_zero_checkpoint_dir(checkpoint_dir)
+    model_state_files = sorted(checkpoint_path.glob("*_model_states.pt"))
+    optim_state_files = sorted(checkpoint_path.glob("*_optim_states.pt"))
+    if len(model_state_files) != 1 or len(optim_state_files) != 1:
+        raise ValueError(
+            f"Expected exactly one model shard and one optimizer shard under {checkpoint_path}, "
+            f"found model={len(model_state_files)} optimizer={len(optim_state_files)}."
+        )
+    model_state = torch.load(model_state_files[0], map_location="cpu", mmap=True, weights_only=False)
+    optim_state = torch.load(optim_state_files[0], map_location="cpu", mmap=True, weights_only=False)
+    return model_state, optim_state, checkpoint_path
+
+
+def _infer_zero_checkpoint_target_dtype(model_state: dict[str, Any]) -> torch.dtype:
+    module_state = model_state.get("module", {})
+    for tensor in module_state.values():
+        if isinstance(tensor, torch.Tensor):
+            return tensor.dtype
+    frozen_param_fragments = model_state.get("frozen_param_fragments", {}) or {}
+    for tensor in frozen_param_fragments.values():
+        if isinstance(tensor, torch.Tensor):
+            return tensor.dtype
+    return torch.float32
+
+
+def _default_peft_model_card(base_model_name_or_path: str, *, peft_version: str) -> str:
+    return f"""---
+base_model: {base_model_name_or_path}
+library_name: peft
+pipeline_tag: text-generation
+tags:
+- base_model:adapter:{base_model_name_or_path}
+- lora
+- transformers
+---
+
+# Model Card for Model ID
+
+<!-- Provide a quick summary of what the model is/does. -->
+
+
+
+## Model Details
+
+### Model Description
+
+<!-- Provide a longer summary of what this model is. -->
+
+
+
+- **Developed by:** [More Information Needed]
+- **Funded by [optional]:** [More Information Needed]
+- **Shared by [optional]:** [More Information Needed]
+- **Model type:** [More Information Needed]
+- **Language(s) (NLP):** [More Information Needed]
+- **License:** [More Information Needed]
+- **Finetuned from model [optional]:** [More Information Needed]
+
+### Model Sources [optional]
+
+<!-- Provide the basic links for the model. -->
+
+- **Repository:** [More Information Needed]
+- **Paper [optional]:** [More Information Needed]
+- **Demo [optional]:** [More Information Needed]
+
+## Uses
+
+<!-- Address questions around how the model is intended to be used, including the foreseeable users of the model and those affected by the model. -->
+
+### Direct Use
+
+<!-- This section is for the model use without fine-tuning or plugging into a larger ecosystem/app. -->
+
+[More Information Needed]
+
+### Downstream Use [optional]
+
+<!-- This section is for the model use when fine-tuned for a task, or when plugged into a larger ecosystem/app -->
+
+[More Information Needed]
+
+### Out-of-Scope Use
+
+<!-- This section addresses misuse, malicious use, and uses that the model will not work well for. -->
+
+[More Information Needed]
+
+## Bias, Risks, and Limitations
+
+<!-- This section is meant to convey both technical and sociotechnical limitations. -->
+
+[More Information Needed]
+
+### Recommendations
+
+<!-- This section is meant to convey recommendations with respect to the bias, risk, and technical limitations. -->
+
+Users (both direct and downstream) should be made aware of the risks, biases and limitations of the model. More information needed for further recommendations.
+
+## How to Get Started with the Model
+
+Use the code below to get started with the model.
+
+[More Information Needed]
+
+## Training Details
+
+### Training Data
+
+<!-- This should link to a Dataset Card, perhaps with a short stub of information on what the training data is all about as well as documentation related to data pre-processing or additional filtering. -->
+
+[More Information Needed]
+
+### Training Procedure
+
+<!-- This relates heavily to the Technical Specifications. Content here should link to that section when it is relevant to the training procedure. -->
+
+#### Preprocessing [optional]
+
+[More Information Needed]
+
+
+#### Training Hyperparameters
+
+- **Training regime:** [More Information Needed] <!--fp32, fp16 mixed precision, bf16 mixed precision, bf16 non-mixed precision, fp16 non-mixed precision, fp8 mixed precision -->
+
+#### Speeds, Sizes, Times [optional]
+
+<!-- This section provides information about throughput, start/end time, checkpoint size if relevant, etc. -->
+
+[More Information Needed]
+
+## Evaluation
+
+<!-- This section describes the evaluation protocols and provides the results. -->
+
+### Testing Data, Factors & Metrics
+
+#### Testing Data
+
+<!-- This should link to a Dataset Card if possible. -->
+
+[More Information Needed]
+
+#### Factors
+
+<!-- These are the things the evaluation is disaggregating by, e.g., subpopulations or domains. -->
+
+[More Information Needed]
+
+#### Metrics
+
+<!-- These are the evaluation metrics being used, ideally with a description of why. -->
+
+[More Information Needed]
+
+### Results
+
+[More Information Needed]
+
+#### Summary
+
+
+
+## Model Examination [optional]
+
+<!-- Relevant interpretability work for the model goes here -->
+
+[More Information Needed]
+
+## Environmental Impact
+
+<!-- Total emissions (in grams of CO2eq) and additional considerations, such as electricity usage, go here. Edit the suggested text below accordingly -->
+
+Carbon emissions can be estimated using the [Machine Learning Impact calculator](https://mlco2.github.io/impact#compute) presented in [Lacoste et al. (2019)](https://arxiv.org/abs/1910.09700).
+
+- **Hardware Type:** [More Information Needed]
+- **Hours used:** [More Information Needed]
+- **Cloud Provider:** [More Information Needed]
+- **Compute Region:** [More Information Needed]
+- **Carbon Emitted:** [More Information Needed]
+
+## Technical Specifications [optional]
+
+### Model Architecture and Objective
+
+[More Information Needed]
+
+### Compute Infrastructure
+
+[More Information Needed]
+
+#### Hardware
+
+[More Information Needed]
+
+#### Software
+
+[More Information Needed]
+
+## Citation [optional]
+
+<!-- If there is a paper or blog post introducing the model, the APA and Bibtex information for that should go in this section. -->
+
+**BibTeX:**
+
+[More Information Needed]
+
+**APA:**
+
+[More Information Needed]
+
+## Glossary [optional]
+
+<!-- If relevant, include terms and calculations in this section that can help readers understand the model or model card. -->
+
+[More Information Needed]
+
+## More Information [optional]
+
+[More Information Needed]
+
+## Model Card Authors [optional]
+
+[More Information Needed]
+
+## Model Card Contact
+
+[More Information Needed]
+### Framework versions
+
+- PEFT {peft_version}
+"""
+
+
+def _base_vocab_size_from_pretrained(model_name_or_path: str, revision: str | None = None) -> int | None:
+    load_kwargs = {"revision": revision} if revision else {}
+    for local_files_only in (True, False):
+        try:
+            config = transformers.AutoConfig.from_pretrained(
+                model_name_or_path,
+                local_files_only=local_files_only,
+                **load_kwargs,
+            )
+            vocab_size = getattr(config, "vocab_size", None)
+            return int(vocab_size) if vocab_size is not None else None
+        except Exception:
+            continue
+    return None
+
+
+def _should_include_zero_checkpoint_embeddings(
+    model_state: dict[str, Any],
+    *,
+    base_vocab_size: int | None,
+) -> bool:
+    frozen_param_shapes = model_state.get("frozen_param_shapes", {}) or {}
+    for name in ("base_model.model.model.embed_tokens.weight", "base_model.model.lm_head.weight"):
+        shape = frozen_param_shapes.get(name)
+        if shape is None:
+            continue
+        if base_vocab_size is None or int(shape[0]) != int(base_vocab_size):
+            return True
+    return False
+
+
+def _build_lora_adapter_state_from_zero_checkpoint(
+    model_state: dict[str, Any],
+    optim_state: dict[str, Any],
+    *,
+    include_embedding_layers: bool,
+) -> OrderedDict[str, torch.Tensor]:
+    param_groups = model_state.get("param_shapes")
+    if not isinstance(param_groups, list) or not param_groups:
+        raise ValueError("ZeRO checkpoint is missing param_shapes for LoRA recovery.")
+
+    optimizer_state_dict = optim_state.get("optimizer_state_dict", {})
+    flat_groups = optimizer_state_dict.get("fp32_flat_groups")
+    if not isinstance(flat_groups, list) or len(flat_groups) != len(param_groups):
+        raise ValueError(
+            "Unsupported ZeRO optimizer state for LoRA recovery: expected fp32_flat_groups aligned with param_shapes."
+        )
+
+    target_dtype = _infer_zero_checkpoint_target_dtype(model_state)
+    adapter_state: OrderedDict[str, torch.Tensor] = OrderedDict()
+
+    for group_idx, (group_shapes, flat_group) in enumerate(zip(param_groups, flat_groups, strict=True)):
+        offset = 0
+        for name, shape in group_shapes.items():
+            shape_tuple = tuple(int(dim) for dim in shape)
+            numel = math.prod(shape_tuple)
+            tensor_view = flat_group.narrow(0, offset, numel).view(shape_tuple)
+            if "lora_" in name or ".modules_to_save." in name:
+                normalized_name = name.replace(".default.", ".")
+                adapter_state[normalized_name] = tensor_view.to(dtype=target_dtype).contiguous().clone()
+            offset += numel
+        if offset != int(flat_group.numel()):
+            raise ValueError(
+                f"Unexpected padding in ZeRO flat group {group_idx}: used {offset} values from {flat_group.numel()}."
+            )
+
+    if include_embedding_layers:
+        frozen_param_shapes = model_state.get("frozen_param_shapes", {}) or {}
+        frozen_param_fragments = model_state.get("frozen_param_fragments", {}) or {}
+        for name in ("base_model.model.model.embed_tokens.weight", "base_model.model.lm_head.weight"):
+            shape = frozen_param_shapes.get(name)
+            fragment = frozen_param_fragments.get(name)
+            if shape is None or fragment is None:
+                continue
+            shape_tuple = tuple(int(dim) for dim in shape)
+            adapter_state[name] = fragment.view(shape_tuple).contiguous().clone()
+
+    return adapter_state
+
+
+def save_lora_adapter_from_zero_checkpoint(
+    checkpoint_dir: str,
+    output_dir: str,
+    *,
+    tokenizer: transformers.PreTrainedTokenizer,
+    base_model_name_or_path: str,
+    lora_rank: int,
+    lora_alpha: float,
+    lora_dropout: float,
+    target_modules: list[str],
+    model_revision: str | None = None,
+) -> dict[str, Any]:
+    from peft import LoraConfig, TaskType, __version__ as peft_version
+
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        tokenizer.add_special_tokens({"pad_token": "<pad>"})
+
+    model_state, optim_state, checkpoint_path = _load_zero_checkpoint_states(checkpoint_dir)
+    base_vocab_size = _base_vocab_size_from_pretrained(base_model_name_or_path, revision=model_revision)
+    include_embedding_layers = _should_include_zero_checkpoint_embeddings(
+        model_state,
+        base_vocab_size=base_vocab_size,
+    )
+    adapter_state = _build_lora_adapter_state_from_zero_checkpoint(
+        model_state,
+        optim_state,
+        include_embedding_layers=include_embedding_layers,
+    )
+
+    output_path = pathlib.Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    save_safetensors_file(adapter_state, str(output_path / "adapter_model.safetensors"))
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=True,
+        r=int(lora_rank),
+        lora_alpha=float(lora_alpha),
+        lora_dropout=float(lora_dropout),
+        target_modules=list(target_modules),
+        bias="none",
+        base_model_name_or_path=base_model_name_or_path,
+    )
+    lora_config.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    (output_path / "README.md").write_text(
+        _default_peft_model_card(base_model_name_or_path, peft_version=peft_version),
+        encoding="utf-8",
+    )
+
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "adapter_keys": len(adapter_state),
+        "include_embedding_layers": include_embedding_layers,
+        "base_vocab_size": base_vocab_size,
+    }
 
 
 @dataclass
