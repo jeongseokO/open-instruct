@@ -14,6 +14,7 @@
 # limitations under the License.
 # isort: off
 import contextlib
+import importlib.util
 import os
 
 os.environ["NCCL_CUMEM_ENABLE"] = "0"  # NOQA
@@ -35,7 +36,7 @@ from typing import Any, Literal
 import datasets
 import torch
 import transformers
-from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate import Accelerator, DataLoaderConfiguration, DistributedType
 from accelerate.accelerator import GradientAccumulationPlugin
 from accelerate.logging import get_logger
 from accelerate.utils import InitProcessGroupKwargs, set_seed
@@ -90,24 +91,104 @@ logger = get_logger(__name__)
 
 FUSION_TOKEN_TEMPLATE = "<|FUSION{}|>"
 DEFAULT_LORA_TARGET_MODULES = ["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"]
+QUESTION_ID_KEY = "question_id"
+
+
+class QuestionGroupedBatchSampler:
+    """Keep all rows from the same question in the same batch."""
+
+    def __init__(
+        self,
+        question_ids,
+        *,
+        max_batch_responses: int,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> None:
+        self.max_batch_responses = int(max_batch_responses)
+        if self.max_batch_responses <= 0:
+            raise ValueError("max_batch_responses must be >= 1.")
+
+        groups: dict[str, list[int]] = {}
+        order: list[str] = []
+        for row_index, raw_question_id in enumerate(question_ids):
+            question_id = str(raw_question_id)
+            if question_id not in groups:
+                groups[question_id] = []
+                order.append(question_id)
+            groups[question_id].append(int(row_index))
+
+        self.packed_batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_size = 0
+        largest_group = 0
+        for question_id in order:
+            group = groups[question_id]
+            group_size = len(group)
+            largest_group = max(largest_group, group_size)
+            if group_size > self.max_batch_responses:
+                raise ValueError(
+                    "question-grouped batching requires every question group to fit in one batch: "
+                    f"largest_group={largest_group}, max_batch_responses={self.max_batch_responses}."
+                )
+            if current_batch and current_size + group_size > self.max_batch_responses:
+                self.packed_batches.append(list(current_batch))
+                current_batch = []
+                current_size = 0
+            current_batch.extend(group)
+            current_size += group_size
+        if current_batch:
+            self.packed_batches.append(list(current_batch))
+
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __iter__(self):
+        batch_order = list(range(len(self.packed_batches)))
+        if self.shuffle and len(batch_order) > 1:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch)
+            permutation = torch.randperm(len(batch_order), generator=generator).tolist()
+            batch_order = [batch_order[idx] for idx in permutation]
+        for batch_index in batch_order:
+            yield list(self.packed_batches[batch_index])
+
+    def __len__(self) -> int:
+        return len(self.packed_batches)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
 
 def _infer_checkpoint_vocab_size_from_load_error(exc: RuntimeError) -> int | None:
     message = str(exc)
-    if "model.embed_tokens.weight" not in message:
-        return None
-    match = re.search(
-        r"model\.embed_tokens\.weight: copying a param with shape torch\.Size\(\[(\d+),\s*\d+\]\) from checkpoint, "
-        r"the shape in current model is torch\.Size\(\[(\d+),\s*\d+\]\)",
-        message,
-    )
-    if match is None:
-        return None
-    checkpoint_vocab = int(match.group(1))
-    current_vocab = int(match.group(2))
-    if checkpoint_vocab <= current_vocab:
-        return None
-    return checkpoint_vocab
+    patterns = []
+    if "model.embed_tokens.weight" in message:
+        patterns.append(
+            r"model\.embed_tokens\.weight: copying a param with shape torch\.Size\(\[(\d+),\s*\d+\]\) from checkpoint, "
+            r"the shape in current model is torch\.Size\(\[(\d+),\s*\d+\]\)"
+        )
+    if "lm_head.weight" in message:
+        patterns.append(
+            r"lm_head\.weight: copying a param with shape torch\.Size\(\[(\d+),\s*\d+\]\) from checkpoint, "
+            r"the shape in current model is torch\.Size\(\[(\d+),\s*\d+\]\)"
+        )
+    if "Error(s) in loading state_dict for Embedding" in message:
+        patterns.append(
+            r"Error\(s\) in loading state_dict for Embedding:\s*size mismatch for weight: copying a param with shape "
+            r"torch\.Size\(\[(\d+),\s*\d+\]\) from checkpoint, the shape in current model is torch\.Size\(\[(\d+),\s*\d+\]\)"
+        )
+
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.DOTALL)
+        if match is None:
+            continue
+        checkpoint_vocab = int(match.group(1))
+        current_vocab = int(match.group(2))
+        if checkpoint_vocab > current_vocab:
+            return checkpoint_vocab
+    return None
 
 
 def _build_fusion_token_strings(num_suffix_specials: int) -> list[str]:
@@ -453,6 +534,59 @@ def _write_capsule_tri_info(output_dir: str, args) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def _should_prepare_capsule_hf_repo(args) -> bool:
+    gate_mode = str(getattr(args, "attention_gate_mode", "off"))
+    return bool(
+        bool(getattr(args, "unified_llopa", False))
+        or bool(getattr(args, "llopa", False))
+        or int(getattr(args, "prefill_lower_layers", 0) or 0) > 0
+        or gate_mode != "off"
+    )
+
+
+def _resolve_capsule_packaging_module():
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates = [
+        repo_root / "Capsule" / "llopa_train.py",
+        repo_root / "llopa_train.py",
+    ]
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("capsule_llopa_train_runtime", str(candidate))
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    return None
+
+
+def _prepare_capsule_hf_repo(output_dir: str, args) -> None:
+    if not output_dir or not _should_prepare_capsule_hf_repo(args):
+        return
+
+    module = _resolve_capsule_packaging_module()
+    if module is None or not hasattr(module, "_prepare_hf_repo"):
+        logger.warning("Capsule HF packaging helper not found; leaving raw training output at %s", output_dir)
+        return
+
+    try:
+        module._prepare_hf_repo(
+            Path(output_dir),
+            str(getattr(args, "model_name_or_path", "") or ""),
+            str(getattr(args, "modeling_family", "llama") or "llama"),
+            str(getattr(args, "llopa_modeling_path", "") or ""),
+            getattr(args, "cache_dir", None),
+            getattr(args, "model_revision", None),
+            getattr(args, "token", None),
+            bool(getattr(args, "local_files_only", False)),
+        )
+        logger.info("Prepared HF-friendly Capsule repo at %s", output_dir)
+    except Exception:
+        logger.exception("Failed to prepare HF-friendly Capsule repo at %s", output_dir)
+
+
 def _maybe_suffix_exp_name_for_system_prefill(args) -> None:
     if not bool(getattr(args, "unified_llopa", False)):
         return
@@ -786,6 +920,15 @@ class FlatArguments:
     )
     per_device_train_batch_size: int = field(
         default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for training."}
+    )
+    group_responses_by_question: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep all responses from the same question in the same batch. "
+                "When enabled, per_device_train_batch_size is interpreted as a response-row budget."
+            )
+        },
     )
     use_lora: bool = field(
         default=False,
@@ -1242,6 +1385,8 @@ class FlatArguments:
 def main(args: FlatArguments, tc: TokenizerConfig):
     if args.train_upper_only > 0 and not args.use_lora:
         raise ValueError("train_upper_only currently requires --use_lora True.")
+    if args.group_responses_by_question and args.per_device_train_batch_size <= 0:
+        raise ValueError("group_responses_by_question requires per_device_train_batch_size >= 1.")
     _maybe_suffix_exp_name_for_system_prefill(args)
 
     # ------------------------------------------------------------
@@ -1406,6 +1551,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             args.dataset_target_columns = [*args.dataset_target_columns, ASSISTANT_HEADER_START_KEY]
         if ASSISTANT_HEADER_STARTS_KEY not in args.dataset_target_columns:
             args.dataset_target_columns = [*args.dataset_target_columns, ASSISTANT_HEADER_STARTS_KEY]
+    if args.group_responses_by_question and QUESTION_ID_KEY not in args.dataset_target_columns:
+        args.dataset_target_columns = [*args.dataset_target_columns, QUESTION_ID_KEY]
     needs_capsule_modeling = bool(
         args.unified_llopa
         or args.llopa
@@ -1493,6 +1640,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             args.num_suffix_specials,
         )
 
+    question_ids_for_batching: list[str] | None = None
     with accelerator.main_process_first():
         transform_fn_args = []
         for fn_name in args.dataset_transform_fn:
@@ -1542,7 +1690,22 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 "Plain vanilla num_suffix_specials requires assistant header boundary metadata in the dataset. "
                 "Use a tokenization transform that emits assistant_header_start(s)."
             )
-        train_dataset = train_dataset.shuffle(seed=args.seed)
+        if args.group_responses_by_question:
+            if QUESTION_ID_KEY not in train_dataset.column_names:
+                raise ValueError(
+                    "group_responses_by_question requires a dataset column named 'question_id'. "
+                    "Make sure the dataset preparation preserves it."
+                )
+            question_ids_for_batching = [str(question_id) for question_id in train_dataset[QUESTION_ID_KEY]]
+            train_dataset = train_dataset.remove_columns([QUESTION_ID_KEY])
+            logger.info(
+                "Question-grouped response batching enabled | response_budget_per_device=%s | questions=%s | rows=%s",
+                args.per_device_train_batch_size,
+                len(set(question_ids_for_batching)),
+                len(question_ids_for_batching),
+            )
+        else:
+            train_dataset = train_dataset.shuffle(seed=args.seed)
         if args.use_single_only and not args.llopa and not prefill_lower_needs_messages and tc.sft_messages_key in train_dataset.column_names:
             train_dataset = train_dataset.remove_columns([tc.sft_messages_key])
         if args.llopa or prefill_lower_needs_messages:
@@ -1673,9 +1836,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
-    # gather deepspeed to get "real" embedding size
+    # Under ZeRO-3 parameters may be partitioned, so gather before reading the embedding size.
     embeddings = model.get_input_embeddings()
-    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
+    embedding_gather_ctx = (
+        deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None)
+        if accelerator.distributed_type == DistributedType.DEEPSPEED
+        else contextlib.nullcontext()
+    )
+    with embedding_gather_ctx:
         embedding_size = embeddings.weight.shape[0]
     # resize does its own gather
     if len(tokenizer) > embedding_size:
@@ -1683,7 +1851,12 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
     # update embedding size after resizing for sum loss
     embeddings = model.get_input_embeddings()
-    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
+    embedding_gather_ctx = (
+        deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None)
+        if accelerator.distributed_type == DistributedType.DEEPSPEED
+        else contextlib.nullcontext()
+    )
+    with embedding_gather_ctx:
         embedding_size = embeddings.weight.shape[0]
 
     if args.use_lora:
@@ -1771,9 +1944,22 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         collate_fn = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest")
 
     accelerator.print("Creating dataloader")
-    train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.per_device_train_batch_size
-    )
+    if args.group_responses_by_question:
+        train_batch_sampler = QuestionGroupedBatchSampler(
+            question_ids_for_batching or [],
+            max_batch_responses=args.per_device_train_batch_size,
+            shuffle=True,
+            seed=args.seed,
+        )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            collate_fn=collate_fn,
+        )
+    else:
+        train_dataloader = DataLoader(
+            train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.per_device_train_batch_size
+        )
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -1833,6 +2019,18 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         num_training_steps=num_training_steps_for_scheduler,
         num_warmup_steps=num_warmup_steps,
     )
+    if args.group_responses_by_question and accelerator.distributed_type == DistributedType.DEEPSPEED:
+        micro_batch_size = int(args.per_device_train_batch_size)
+        global_batch_size = micro_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        deepspeed_plugin = getattr(accelerator.state, "deepspeed_plugin", None)
+        if deepspeed_plugin is not None:
+            deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = micro_batch_size
+            deepspeed_plugin.deepspeed_config["train_batch_size"] = global_batch_size
+            logger.info(
+                "Question-grouped batching with DeepSpeed: setting train_micro_batch_size_per_gpu=%s, train_batch_size=%s",
+                micro_batch_size,
+                global_batch_size,
+            )
     # Prepare everything with `accelerator`.
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
@@ -1859,6 +2057,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    if args.group_responses_by_question:
+        logger.info("  Question-grouped batching = enabled (batch size units = response rows)")
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
@@ -2378,6 +2578,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             )
         if accelerator.is_main_process:
             _write_capsule_tri_info(args.output_dir, args)
+            _prepare_capsule_hf_repo(args.output_dir, args)
 
     # remove all checkpoints to save space
     if args.clean_checkpoints_at_end and accelerator.is_local_main_process:
