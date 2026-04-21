@@ -556,6 +556,26 @@ def _get_prefill_lower_solo_bos_segmented_step_fn(model):
     return None
 
 
+def _get_prefill_lower_solo_v2_segmented_step_fn(model):
+    candidates = []
+    m = _unwrap_model(model)
+    candidates.append(m)
+    if hasattr(m, "base_model"):
+        candidates.append(getattr(m, "base_model"))
+    if hasattr(m, "get_base_model"):
+        try:
+            candidates.append(m.get_base_model())
+        except Exception:
+            pass
+    if hasattr(m, "model"):
+        candidates.append(getattr(m, "model"))
+
+    for cand in candidates:
+        if cand is not None and hasattr(cand, "segmented_prefill_lower_solo_v2_step_logits"):
+            return getattr(cand, "segmented_prefill_lower_solo_v2_step_logits")
+    return None
+
+
 def compute_llopa_batch_loss(
     model,
     tokenizer,
@@ -813,6 +833,57 @@ def compute_prefill_lower_solo_bos_batch_loss(
     )
     if out is None or out.loss is None:
         logger.warning("No valid prefill-lower solo-BOS-attention losses in current batch; skipping this batch.")
+        return _zero_proxy_loss(model, batch, device)
+    return out.loss
+
+
+def compute_prefill_lower_solo_v2_batch_loss(
+    model,
+    batch: dict[str, Any],
+    *,
+    lower_k: int,
+    prefill_attn: str,
+    system_prefill: str,
+    with_bos: bool = False,
+):
+    device = batch["input_ids"].device
+    system_ids = batch.get(PREFILL_SYSTEM_IDS_KEY)
+    user_ids = batch.get(PREFILL_USER_IDS_KEY)
+    assistant_ids = batch.get(PREFILL_ASSISTANT_IDS_KEY)
+    labels = batch.get(PREFILL_LABELS_KEY)
+    system_mask = batch.get(PREFILL_SYSTEM_MASK_KEY)
+    user_mask = batch.get(PREFILL_USER_MASK_KEY)
+    assistant_mask = batch.get(PREFILL_ASSISTANT_MASK_KEY)
+    if (
+        system_ids is None
+        or user_ids is None
+        or assistant_ids is None
+        or labels is None
+        or system_mask is None
+        or user_mask is None
+        or assistant_mask is None
+    ):
+        raise RuntimeError("Prefill-lower solo-attention-v2 training requires prebatched structured segment tensors.")
+
+    step_fn = _get_prefill_lower_solo_v2_segmented_step_fn(model)
+    if step_fn is None:
+        raise RuntimeError("Prefill-lower solo-attention-v2 training requires segmented_prefill_lower_solo_v2_step_logits on the model.")
+    out = step_fn(
+        system_ids=system_ids.to(device=device),
+        user_ids=user_ids.to(device=device),
+        assistant_ids=assistant_ids.to(device=device),
+        system_attention_mask=system_mask.to(device=device),
+        user_attention_mask=user_mask.to(device=device),
+        assistant_attention_mask=assistant_mask.to(device=device),
+        labels=labels.to(device=device),
+        lower_k=int(lower_k),
+        logits_to_keep=int(assistant_ids.size(1)),
+        prefill_attn=str(prefill_attn),
+        system_prefill=str(system_prefill),
+        with_bos=bool(with_bos),
+    )
+    if out is None or out.loss is None:
+        logger.warning("No valid prefill-lower solo-attention-v2 losses in current batch; skipping this batch.")
         return _zero_proxy_loss(model, batch, device)
     return out.loss
 

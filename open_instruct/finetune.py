@@ -65,6 +65,7 @@ from open_instruct.llopa_adapter import (
     compute_prefill_lower_freeze_batch_loss,
     compute_prefill_lower_solo_bos_batch_loss,
     compute_prefill_lower_solo_batch_loss,
+    compute_prefill_lower_solo_v2_batch_loss,
     compute_llopa_batch_loss,
     compute_llopa_batch_loss_streaming_backward,
     get_prefill_lower_system_len,
@@ -1093,6 +1094,21 @@ class FlatArguments:
             )
         },
     )
+    prefill_lower_solo_attention_v2: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Solo-attention-v2 baseline: lower K layers are computed normally, then every upper-layer token uses "
+                "self-only attention."
+            )
+        },
+    )
+    prefill_lower_solo_attention_v2_with_bos: bool = field(
+        default=False,
+        metadata={
+            "help": "Solo-attention-v2 option: allow each upper-layer token to attend to BOS in addition to itself."
+        },
+    )
     prefill_lower_solo_bos_attention: bool = field(
         default=False,
         metadata={
@@ -1310,6 +1326,25 @@ class FlatArguments:
                 raise ValueError("prefill_lower_solo_attention cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
             if self.load_balancing_loss:
                 raise ValueError("prefill_lower_solo_attention does not support load_balancing_loss.")
+        if self.prefill_lower_solo_attention_v2_with_bos and not self.prefill_lower_solo_attention_v2:
+            raise ValueError("prefill_lower_solo_attention_v2_with_bos requires --prefill_lower_solo_attention_v2.")
+        if self.prefill_lower_solo_attention_v2:
+            if self.prefill_lower_layers <= 0:
+                raise ValueError("prefill_lower_solo_attention_v2 requires prefill_lower_layers > 0.")
+            if self.unified_llopa:
+                raise ValueError("prefill_lower_solo_attention_v2 cannot be combined with --unified_llopa.")
+            if self.llopa:
+                raise ValueError("prefill_lower_solo_attention_v2 cannot be combined with --llopa.")
+            if self.no_upper_layers:
+                raise ValueError("prefill_lower_solo_attention_v2 cannot be combined with --no_upper_layers.")
+            if self.prefill_lower_freeze:
+                raise ValueError("prefill_lower_solo_attention_v2 cannot be combined with --prefill_lower_freeze.")
+            if self.prefill_lower_solo_attention or self.prefill_lower_solo_bos_attention:
+                raise ValueError("prefill_lower_solo_attention_v2 cannot be combined with the legacy solo-attention baselines.")
+            if self.skip_upper_attention_layers > 0 or self.solo_attention_layers > 0:
+                raise ValueError("prefill_lower_solo_attention_v2 cannot be combined with --skip_upper_attention_layers or --solo_attention_layers.")
+            if self.load_balancing_loss:
+                raise ValueError("prefill_lower_solo_attention_v2 does not support load_balancing_loss.")
         if self.prefill_lower_solo_bos_attention:
             if self.prefill_lower_layers <= 0:
                 raise ValueError("prefill_lower_solo_bos_attention requires prefill_lower_layers > 0.")
@@ -1336,6 +1371,8 @@ class FlatArguments:
                 raise ValueError("replay_module cannot be combined with --prefill_lower_freeze.")
             if self.prefill_lower_solo_attention:
                 raise ValueError("replay_module cannot be combined with --prefill_lower_solo_attention.")
+            if self.prefill_lower_solo_attention_v2:
+                raise ValueError("replay_module cannot be combined with --prefill_lower_solo_attention_v2.")
             if self.prefill_lower_solo_bos_attention:
                 raise ValueError("replay_module cannot be combined with --prefill_lower_solo_bos_attention.")
         if self.unified_llopa:
@@ -1639,6 +1676,14 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             logger.info(
                 "Prefill-lower solo-attention baseline enabled | lower_k=%s | modeling=%s | family=%s",
                 args.prefill_lower_layers,
+                modeling_path,
+                args.modeling_family,
+            )
+        if args.prefill_lower_solo_attention_v2:
+            logger.info(
+                "Prefill-lower solo-attention-v2 baseline enabled | lower_k=%s | with_bos=%s | modeling=%s | family=%s",
+                args.prefill_lower_layers,
+                int(bool(args.prefill_lower_solo_attention_v2_with_bos)),
                 modeling_path,
                 args.modeling_family,
             )
@@ -1970,6 +2015,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             system_prefill=str(args.llopa_system_prefill),
             enable_batched_last_turn=bool(
                 args.prefill_lower_solo_attention
+                or args.prefill_lower_solo_attention_v2
                 or args.prefill_lower_solo_bos_attention
                 or args.prefill_lower_freeze
             ),
@@ -2314,6 +2360,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_lower_attn=str(args.prefill_lower_attn),
                             prefill_lower_system_prefill=str(args.llopa_system_prefill),
                             prefill_lower_solo_attention=bool(args.prefill_lower_solo_attention),
+                            prefill_lower_solo_attention_v2=bool(args.prefill_lower_solo_attention_v2),
+                            prefill_lower_solo_attention_v2_with_bos=bool(args.prefill_lower_solo_attention_v2_with_bos),
                             prefill_lower_solo_bos_attention=bool(args.prefill_lower_solo_bos_attention),
                             prefill_lower_replay_module=str(args.replay_module),
                             prefill_lower_replay_per_layers=int(args.replay_per_layers),
@@ -2339,6 +2387,15 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_attn=str(args.prefill_lower_attn),
                             system_prefill=str(args.llopa_system_prefill),
                         )
+                    elif args.prefill_lower_solo_attention_v2:
+                        loss = compute_prefill_lower_solo_v2_batch_loss(
+                            model=model,
+                            batch=batch,
+                            lower_k=int(args.prefill_lower_layers),
+                            prefill_attn=str(args.prefill_lower_attn),
+                            system_prefill=str(args.llopa_system_prefill),
+                            with_bos=bool(args.prefill_lower_solo_attention_v2_with_bos),
+                        )
                     elif args.prefill_lower_solo_bos_attention:
                         loss = compute_prefill_lower_solo_bos_batch_loss(
                             model=model,
@@ -2356,6 +2413,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_lower_attn=str(args.prefill_lower_attn),
                             prefill_lower_system_prefill=str(args.llopa_system_prefill),
                             prefill_lower_solo_attention=bool(args.prefill_lower_solo_attention),
+                            prefill_lower_solo_attention_v2=bool(args.prefill_lower_solo_attention_v2),
+                            prefill_lower_solo_attention_v2_with_bos=bool(args.prefill_lower_solo_attention_v2_with_bos),
                             prefill_lower_solo_bos_attention=bool(args.prefill_lower_solo_bos_attention),
                             prefill_lower_replay_module=str(args.replay_module),
                             prefill_lower_replay_per_layers=int(args.replay_per_layers),
