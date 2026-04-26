@@ -491,6 +491,7 @@ def _set_capsule_runtime_metadata(model: torch.nn.Module, args) -> None:
         setattr(config, "capsule_system_prefill", str(args.system_prefill))
         setattr(config, "capsule_user_prefill", str(args.user_prefill))
         setattr(config, "capsule_no_upper_attn", bool(args.no_upper_attn))
+        setattr(config, "capsule_upper_attention_mode", _normalize_upper_attention_mode(getattr(args, "upper_attention_mode", "causal")))
         setattr(config, "capsule_replay_module", str(getattr(args, "replay_module", "none")))
         setattr(config, "capsule_last_layer_module", str(getattr(args, "replay_module", "none")))
         setattr(config, "capsule_replay_per_layers", int(getattr(args, "replay_per_layers", -1) or -1))
@@ -525,6 +526,7 @@ def _write_capsule_tri_info(output_dir: str, args) -> None:
         f"system_prefill={str(args.system_prefill)}",
         f"user_prefill={str(args.user_prefill)}",
         f"no_upper_attn={int(bool(args.no_upper_attn))}",
+        f"upper_attention_mode={_normalize_upper_attention_mode(getattr(args, 'upper_attention_mode', 'causal'))}",
         f"replay_module={str(getattr(args, 'replay_module', 'none'))}",
         f"replay_per_layers={int(getattr(args, 'replay_per_layers', -1) or -1)}",
         f"last_layer_module={str(getattr(args, 'replay_module', 'none'))}",
@@ -610,6 +612,26 @@ def _use_vanilla_suffix_specials(args) -> bool:
 def _normalize_fusion_mode(mode: Any) -> str:
     normalized = str(mode or "upper_only").strip().lower()
     return normalized or "upper_only"
+
+
+def _normalize_upper_attention_mode(mode: Any) -> str:
+    normalized = str(mode or "causal").strip().lower().replace("-", "_")
+    aliases = {
+        "": "causal",
+        "normal": "causal",
+        "default": "causal",
+        "full": "causal",
+        "causal_attention": "causal",
+        "self": "solo_v2",
+        "self_only": "solo_v2",
+        "solo": "solo_v2",
+        "solo2": "solo_v2",
+        "solo_attention_v2": "solo_v2",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"causal", "solo_v2"}:
+        raise ValueError("upper_attention_mode must be one of {'causal', 'solo_v2'}.")
+    return normalized
 
 
 def _normalize_attention_gate_mode(mode: Any) -> str:
@@ -971,6 +993,10 @@ class FlatArguments:
         default=False,
         metadata={"help": "Unified LLoPA decode optimization: skip upper-layer attention."},
     )
+    upper_attention_mode: str = field(
+        default="causal",
+        metadata={"help": "Unified LLoPA upper-layer attention mode: causal | solo_v2."},
+    )
     attention_gate_mode: str = field(
         default="off",
         metadata={
@@ -1281,6 +1307,7 @@ class FlatArguments:
             raise NotImplementedError("num_suffix_specials currently supports modeling_family='llama' only.")
         self.attention_gate_mode = _normalize_attention_gate_mode(self.attention_gate_mode)
         self.fusion_mode = _normalize_fusion_mode(self.fusion_mode)
+        self.upper_attention_mode = _normalize_upper_attention_mode(self.upper_attention_mode)
         if self.last_layer_module is not None and _normalize_replay_module(self.replay_module) == "none":
             self.replay_module = self.last_layer_module
         self.replay_module = _normalize_replay_module(self.replay_module)
@@ -1398,6 +1425,10 @@ class FlatArguments:
                 raise ValueError("unified_llopa cannot be combined with --no_upper_layers.")
             if self.replay_module != "none" and self.no_upper_attn:
                 raise ValueError("replay_module cannot be combined with --no_upper_attn.")
+            if self.upper_attention_mode == "solo_v2" and self.no_upper_attn:
+                raise ValueError("upper_attention_mode=solo_v2 cannot be combined with --no_upper_attn.")
+            if self.upper_attention_mode == "solo_v2" and self.replay_module != "none":
+                raise ValueError("replay_module cannot be combined with upper_attention_mode=solo_v2.")
         elif self.fusion_mode == "inband":
             raise ValueError("fusion_mode='inband' is supported with --unified_llopa only.")
         elif self.replay_module != "none" and self.prefill_lower_layers <= 0:
@@ -1641,12 +1672,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         install_llopa_modeling(modeling_path=modeling_path, model_family=args.modeling_family)
         if args.unified_llopa:
             logger.info(
-                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | replay_module=%s | replay_per_layers=%s | fusion_mode=%s | num_suffix_specials=%s | attention_gate_mode=%s | modeling=%s | family=%s",
+                "Unified LLoPA enabled | lower_k=%s | prefill_mode=%s | prefill_attn=%s | system_prefill=%s | no_upper_attn=%s | upper_attention_mode=%s | replay_module=%s | replay_per_layers=%s | fusion_mode=%s | num_suffix_specials=%s | attention_gate_mode=%s | modeling=%s | family=%s",
                 args.lower_layers,
                 args.prefill_mode,
                 args.prefill_attn,
                 args.system_prefill,
                 args.no_upper_attn,
+                args.upper_attention_mode,
                 args.replay_module,
                 args.replay_per_layers,
                 _normalize_fusion_mode(args.fusion_mode),
@@ -1829,6 +1861,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     setattr(config, "capsule_suffix_special_token_ids", list(fusion_token_ids))
     setattr(config, "capsule_fusion_mode", _normalize_fusion_mode(args.fusion_mode))
     setattr(config, "capsule_attention_gate_mode", str(args.attention_gate_mode))
+    setattr(config, "capsule_upper_attention_mode", _normalize_upper_attention_mode(args.upper_attention_mode))
     if (
         args.num_suffix_specials > 0
         and args.no_upper_attn
@@ -2293,6 +2326,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             loss = None
             loss_already_backwarded = False
             local_oom = torch.zeros(1, dtype=torch.int32, device=accelerator.device)
+            distributed_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+            can_skip_forward_oom = not distributed_initialized or getattr(accelerator, "num_processes", 1) == 1
             using_stream_backward = args.llopa and args.llopa_loss_scope == "all_assistant" and args.llopa_stream_backward
             profile_this_step = bool(args.llopa_profile_memory_steps > 0 and completed_steps < args.llopa_profile_memory_steps)
             _set_llopa_profile_state(
@@ -2315,6 +2350,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                             prefill_lower_attn=str(args.prefill_attn),
                             prefill_lower_system_prefill=str(args.system_prefill),
                             prefill_lower_no_upper_attn=bool(args.no_upper_attn),
+                            prefill_lower_upper_attention_mode=str(args.upper_attention_mode),
                             prefill_lower_replay_module=str(args.replay_module),
                             prefill_lower_replay_per_layers=int(args.replay_per_layers),
                         )
@@ -2433,6 +2469,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                         "CUDA OOM occurred during LLoPA streaming-backward path. "
                         "This path cannot safely skip OOM batches in distributed mode."
                     ) from exc
+                if not can_skip_forward_oom:
+                    raise RuntimeError(
+                        "CUDA OOM occurred during forward on one rank. "
+                        "Skipping a forward OOM batch is unsafe with multi-rank distributed training "
+                        "because DeepSpeed ZeRO-3 may already have outstanding parameter all-gathers on "
+                        "other ranks. Reduce max_seq_length/per-device batch size or filter long samples."
+                    ) from exc
                 local_oom.fill_(1)
                 if accelerator.is_main_process:
                     logger.warning("CUDA OOM detected. Marking this batch to skip across all ranks.")
@@ -2443,7 +2486,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 with contextlib.suppress(Exception):
                     torch.cuda.empty_cache()
 
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if distributed_initialized and can_skip_forward_oom:
                 torch.distributed.all_reduce(local_oom, op=torch.distributed.ReduceOp.MAX)
 
             if local_oom.item() > 0:
