@@ -354,17 +354,33 @@ def _infer_all_linear_lora_targets(model: torch.nn.Module) -> list[str]:
     return found
 
 
-def _resolve_lora_target_modules(model: torch.nn.Module, raw_targets: Any) -> list[str]:
+def _has_module_leaf_name(model: torch.nn.Module, leaf_name: str) -> bool:
+    return any(name.rsplit(".", 1)[-1] == leaf_name for name, _ in model.named_modules())
+
+
+def _resolve_lora_target_modules(
+    model: torch.nn.Module,
+    raw_targets: Any,
+    attention_gate_mode: Any = "off",
+) -> list[str]:
     targets = _split_lora_target_modules(raw_targets)
     if not targets:
-        return list(DEFAULT_LORA_TARGET_MODULES)
+        resolved = list(DEFAULT_LORA_TARGET_MODULES)
+    else:
+        resolved = targets
 
-    normalized = {target.lower().replace("-", "_") for target in targets}
+    normalized = {target.lower().replace("-", "_") for target in resolved}
     if normalized & {"all_linear", "alllinear"}:
         if len(targets) != 1:
             raise ValueError("lora_target_modules cannot mix all_linear with explicit module names.")
-        return _infer_all_linear_lora_targets(model)
-    return targets
+        resolved = _infer_all_linear_lora_targets(model)
+
+    if _normalize_attention_gate_mode(attention_gate_mode) != "off":
+        if not _has_module_leaf_name(model, "sdpa_gate_proj"):
+            raise ValueError("attention_gate_mode is enabled, but model has no sdpa_gate_proj module.")
+        if "sdpa_gate_proj" not in {target.rsplit(".", 1)[-1] for target in resolved}:
+            resolved.append("sdpa_gate_proj")
+    return resolved
 
 
 def _resolve_transformer_layer_container(
@@ -1983,7 +1999,11 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             model.gradient_checkpointing_enable()
 
         logger.info("Initializing LORA model...")
-        target_modules = _resolve_lora_target_modules(model, getattr(args, "lora_target_modules", []))
+        target_modules = _resolve_lora_target_modules(
+            model,
+            getattr(args, "lora_target_modules", []),
+            getattr(args, "attention_gate_mode", "off"),
+        )
         logger.info("LoRA target_modules=%s", target_modules)
         peft_config_kwargs = dict(
             task_type=TaskType.CAUSAL_LM,
@@ -2698,7 +2718,11 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                     final_zero_checkpoint_dir,
                     args.output_dir,
                 )
-                target_modules = _resolve_lora_target_modules(model, getattr(args, "lora_target_modules", []))
+                target_modules = _resolve_lora_target_modules(
+                    model,
+                    getattr(args, "lora_target_modules", []),
+                    getattr(args, "attention_gate_mode", "off"),
+                )
                 offline_result = save_lora_adapter_from_zero_checkpoint(
                     final_zero_checkpoint_dir,
                     args.output_dir,
